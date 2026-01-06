@@ -5,7 +5,7 @@
     "settings": "设置",
     "getStarted": "开始使用",
     "learnMore": "了解更多",
-    "starOnGitHub": "在 GitHub 上点赞",
+    "starOnGitHub": "点赞",
     "send": "发送",
     "stop": "停止",
     "linkNotReliable": "此链接可能是 AI 生成的幻觉，可能并不可靠。",
@@ -21,16 +21,16 @@
   "hero": {
     "title": "深度研究",
     "subtitle": "触手可及",
-    "description": "认识 DeerFlow，您的个人深度研究助手。凭借搜索引擎、网络爬虫、Python 和 MCP 服务等强大工具，它能提供即时洞察、全面报告，甚至制作引人入胜的播客。",
-    "footnote": "* DEER 代表深度探索和高效研究。"
+    "description": "您的个人深度研究助手。凭借搜索引擎、Python 和 MCP 服务等强大工具，它能提供即时洞察、全面报告，甚至制作引人入胜的播客。",
+    "footnote": "* 深度探索和高效研究。"
   },
   "settings": {
-    "title": "DeerFlow 设置",
-    "description": "在这里管理您的 DeerFlow 设置。",
+    "title": "设置",
+    "description": "在这里管理您的设置。",
     "cancel": "取消",
     "addServers": "添加服务器",
     "addNewMCPServers": "添加新的 MCP 服务器",
-    "mcpConfigDescription": "DeerFlow 使用标准 JSON MCP 配置来创建新服务器。",
+    "mcpConfigDescription": "使用标准 JSON MCP 配置来创建新服务器。",
     "pasteConfigBelow": "将您的配置粘贴到下面，然后点击\"添加\"来添加新服务器。",
     "rag": {
       "title": "资源",
@@ -56,12 +56,12 @@
       "maxStepsDescription": "默认情况下，每个研究计划有 3 个步骤。",
       "maxSearchResults": "最大搜索结果数",
       "maxSearchResultsDescription": "默认情况下，每个搜索步骤有 3 个结果。",
-      "enableWebSearch": "启用网络搜索",
-      "enableWebSearchDescription": "禁用后将仅使用本地 RAG 知识库。适用于无网络环境。"
+      "enableWebSearch": "启用外网搜索（暂时无效）",
+      "enableWebSearchDescription": "禁用后将仅使用本地 RAG 知识库。（默认模式）"
     },
     "mcp": {
       "title": "MCP 服务器",
-      "description": "模型上下文协议通过集成外部工具来增强 DeerFlow，用于私域搜索、网页浏览、订餐等任务。点击这里",
+      "description": "模型上下文协议通过集成外部工具来增强，用于私域搜索、网页浏览、订餐等任务。点击这里",
       "learnMore": "了解更多关于 MCP 的信息。",
       "enableDisable": "启用/禁用服务器",
       "deleteServer": "删除服务器",
@@ -79,19 +79,19 @@
       "title": "关于"
     },
     "reportStyle": {
-      "writingStyle": "写作风格",
-      "chooseTitle": "选择写作风格",
-      "chooseDesc": "请选择您的研究报告的写作风格。不同风格适用于不同受众和用途。",
-      "academic": "学术",
+      "writingStyle": "对话风格",
+      "chooseTitle": "选择对话风格",
+      "chooseDesc": "请选择对话风格。不同风格适用于不同用途。",
+      "academic": "知识运营",
       "academicDesc": "正式、客观、分析性强，术语精确",
-      "popularScience": "科普",
+      "popularScience": "知识查询",
       "popularScienceDesc": "生动有趣，适合大众阅读",
-      "news": "新闻",
-      "newsDesc": "事实、简明、公正的新闻风格",
-      "socialMedia": "社交媒体",
+      "news": "知识质检",
+      "newsDesc": "事实、简明、公正的风格",
+      "socialMedia": "知识教学",
       "socialMediaDesc": "简洁有趣，易于传播",
-      "strategicInvestment": "战略投资",
-      "strategicInvestmentDesc": "面向战略投资机构的深度综合分析，提供可执行的投资洞察"
+      "strategicInvestment": "知识洞察",
+      "strategicInvestmentDesc": "深度综合分析，提供知识洞察"
     }
   },
   "footer": {
@@ -101,13 +101,13 @@
   },
   "chat": {
     "page": {
-      "loading": "正在加载 DeerFlow...",
+      "loading": "正在加载...",
       "welcomeUser": "欢迎，{username}",
-      "starOnGitHub": "在 GitHub 上点赞"
+      "starOnGitHub": "点赞"
     },
     "welcome": {
       "greeting": "👋 你好！",
-      "description": "欢迎来到 🦌 DeerFlow，一个基于前沿语言模型构建的深度研究助手，帮助您搜索网络、浏览信息并处理复杂任务。"
+      "description": "这是一个基于前沿语言模型构建的深度研究助手，帮助您搜索知识库、浏览信息并处理复杂任务。"
     },
     "conversationStarters": [
       "埃菲尔铁塔比世界最高建筑高多少倍？",
@@ -119,12 +119,12 @@
       "deepThinking": "深度思考",
       "deepThinkingTooltip": {
         "title": "深度思考模式：{status}",
-        "description": "启用后，DeerFlow 将使用推理模型（{model}）生成更深思熟虑的计划。"
+        "description": "启用后将使用推理模型（{model}）生成更深思熟虑的计划。"
       },
       "investigation": "调研",
       "investigationTooltip": {
         "title": "调研模式：{status}",
-        "description": "启用后，DeerFlow 将在规划前进行快速搜索。这对于与时事和新闻相关的研究很有用。"
+        "description": "启用后将在规划前进行快速搜索。这对于与时事和新闻相关的研究很有用。"
       },
       "enhancePrompt": "用 AI 增强提示",
       "on": "开启",
@@ -191,9 +191,9 @@
     },
     "messages": {
       "replaying": "回放中",
-      "replayDescription": "DeerFlow 正在回放对话...",
+      "replayDescription": "正在回放对话...",
       "replayHasStopped": "回放已停止。",
-      "replayModeDescription": "您现在处于 DeerFlow 的回放模式。点击右侧的\"播放\"按钮开始。",
+      "replayModeDescription": "您现在处于回放模式。点击右侧的\"播放\"按钮开始。",
       "play": "播放",
       "fastForward": "快进",
       "demoNotice": "* 此网站仅用于演示目的。如果您想尝试自己的问题，请",
@@ -210,7 +210,7 @@
   "landing": {
     "caseStudies": {
       "title": "案例研究",
-      "description": "通过回放查看 DeerFlow 的实际应用。",
+      "description": "通过回放查看实际应用。",
       "clickToWatch": "点击观看回放",
       "cases": [
         {
@@ -249,7 +249,7 @@
     },
     "coreFeatures": {
       "title": "核心功能",
-      "description": "了解是什么让 DeerFlow 如此有效。",
+      "description": "了解是什么让深度研究如此有效。",
       "features": [
         {
           "name": "深入挖掘，触及更广",
@@ -278,8 +278,8 @@
       "description": "通过我们的监督者 + 交接设计模式体验智能体团队合作。"
     },
     "joinCommunity": {
-      "title": "加入 DeerFlow 社区",
-      "description": "贡献精彩想法，塑造 DeerFlow 的未来。协作、创新并产生影响。",
+      "title": "加入社区",
+      "description": "贡献精彩想法，塑造的未来。协作、创新并产生影响。",
       "contributeNow": "立即贡献"
     }
   }

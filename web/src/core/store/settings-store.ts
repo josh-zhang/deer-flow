@@ -14,11 +14,11 @@ const DEFAULT_SETTINGS: SettingsState = {
     maxClarificationRounds: 3,
     enableDeepThinking: false,
     enableBackgroundInvestigation: false,
-    enableWebSearch: true,
+    enableWebSearch: false,
     maxPlanIterations: 1,
     maxStepNum: 3,
     maxSearchResults: 3,
-    reportStyle: "academic",
+    reportStyle: "popular_science",
   },
   mcp: {
     servers: [],
