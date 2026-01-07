@@ -24,9 +24,7 @@ class Step(BaseModel):
 
 
 class Plan(BaseModel):
-    locale: str = Field(
-        ..., description="e.g. 'en-US' or 'zh-CN', based on the user's language"
-    )
+    locale: str = 'zh-CN'
     has_enough_context: bool
     thought: str = Field(default="", description="Thinking process for the plan")
     title: str
