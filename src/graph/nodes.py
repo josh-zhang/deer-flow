@@ -523,7 +523,7 @@ def human_feedback_node(
 
 def coordinator_node(
     state: State, config: RunnableConfig
-) -> Command[Literal["planner", "background_investigator", "coordinator", "__end__"]]:
+) -> Command[Literal["planner", "coordinator", "__end__"]]:
     """Coordinator node that communicate with customers and handle clarification."""
     logger.info("Coordinator talking.")
     configurable = Configuration.from_runnable_config(config)
@@ -780,8 +780,8 @@ def coordinator_node(
             logger.info("No tool calls in legacy mode - ending workflow gracefully")
 
     # Apply background_investigation routing if enabled (unified logic)
-    if goto == "planner" and state.get("enable_background_investigation"):
-        goto = "background_investigator"
+    # if goto == "planner" and state.get("enable_background_investigation"):
+    #     goto = "background_investigator"
 
     # Set default values for state variables (in case they're not defined in legacy mode)
     if not enable_clarification:

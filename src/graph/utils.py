@@ -7,9 +7,9 @@ ASSISTANT_SPEAKER_NAMES = {
     "coordinator",
     "planner",
     "researcher",
-    "coder",
+    # "coder",
     "reporter",
-    "background_investigator",
+    # "background_investigator",
 }
 
 
