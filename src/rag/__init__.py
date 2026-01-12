@@ -7,6 +7,7 @@ from .milvus import MilvusProvider
 from .moi import MOIProvider
 from .qdrant import QdrantProvider
 from .ragflow import RAGFlowProvider
+from .mskb import MSKBProvider
 from .retriever import Chunk, Document, Resource, Retriever
 from .vikingdb_knowledge_base import VikingDBKnowledgeBaseProvider
 
@@ -19,6 +20,7 @@ __all__ = [
     MOIProvider,
     MilvusProvider,
     QdrantProvider,
+    MSKBProvider,
     VikingDBKnowledgeBaseProvider,
     Chunk,
     build_retriever,

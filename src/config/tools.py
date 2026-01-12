@@ -35,6 +35,7 @@ class RAGProvider(enum.Enum):
     MOI = "moi"
     MILVUS = "milvus"
     QDRANT = "qdrant"
+    MSKB = "kskb"
 
 
 SELECTED_RAG_PROVIDER = os.getenv("RAG_PROVIDER")
