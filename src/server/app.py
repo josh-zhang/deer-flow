@@ -1006,20 +1006,22 @@ async def enhance_prompt(request: EnhancePromptRequest):
             try:
                 # Handle both uppercase and lowercase input
                 style_mapping = {
-                    "ACADEMIC": ReportStyle.ACADEMIC,
-                    "POPULAR_SCIENCE": ReportStyle.POPULAR_SCIENCE,
-                    "NEWS": ReportStyle.NEWS,
-                    "SOCIAL_MEDIA": ReportStyle.SOCIAL_MEDIA,
-                    "STRATEGIC_INVESTMENT": ReportStyle.STRATEGIC_INVESTMENT,
+                    "BANK_BUSINESS_ANALYSIS": ReportStyle.BANK_BUSINESS_ANALYSIS,
+                    "CUSTOMER_SERVICE_SCRIPT": ReportStyle.CUSTOMER_SERVICE_SCRIPT,
+                    # "ACADEMIC": ReportStyle.ACADEMIC,
+                    # "POPULAR_SCIENCE": ReportStyle.POPULAR_SCIENCE,
+                    # "NEWS": ReportStyle.NEWS,
+                    # "SOCIAL_MEDIA": ReportStyle.SOCIAL_MEDIA,
+                    # "STRATEGIC_INVESTMENT": ReportStyle.STRATEGIC_INVESTMENT,
                 }
                 report_style = style_mapping.get(
-                    request.report_style.upper(), ReportStyle.ACADEMIC
+                    request.report_style.upper(), ReportStyle.BANK_BUSINESS_ANALYSIS
                 )
             except Exception:
-                # If invalid style, default to ACADEMIC
-                report_style = ReportStyle.ACADEMIC
+                # If invalid style, default to BANK_BUSINESS_ANALYSIS
+                report_style = ReportStyle.BANK_BUSINESS_ANALYSIS
         else:
-            report_style = ReportStyle.ACADEMIC
+            report_style = ReportStyle.BANK_BUSINESS_ANALYSIS
 
         workflow = build_prompt_enhancer_graph()
         final_state = workflow.invoke(

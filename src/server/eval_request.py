@@ -14,7 +14,7 @@ class EvaluateReportRequest(BaseModel):
     content: str = Field(description="Report markdown content to evaluate")
     query: str = Field(description="Original research query")
     report_style: Optional[str] = Field(
-        default="default", description="Report style (academic, news, etc.)"
+        default="default", description="Report style (customer_service_script, bank_business_analysis, etc.)"
     )
     use_llm: bool = Field(
         default=False,

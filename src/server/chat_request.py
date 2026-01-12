@@ -66,7 +66,7 @@ class ChatRequest(BaseModel):
         True, description="Whether to enable web search, set to False to use only local RAG"
     )
     report_style: Optional[ReportStyle] = Field(
-        ReportStyle.ACADEMIC, description="The style of the report"
+        ReportStyle.BANK_BUSINESS_ANALYSIS, description="The style of the report"
     )
     enable_deep_thinking: Optional[bool] = Field(
         False, description="Whether to enable deep thinking"
@@ -126,5 +126,5 @@ class EnhancePromptRequest(BaseModel):
         "", description="Additional context about the intended use"
     )
     report_style: Optional[str] = Field(
-        "academic", description="The style of the report"
+        "bank_business_analysis", description="The style of the report"
     )

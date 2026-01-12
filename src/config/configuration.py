@@ -49,7 +49,7 @@ class Configuration:
     max_step_num: int = 3  # Maximum number of steps in a plan
     max_search_results: int = 3  # Maximum number of search results
     mcp_settings: dict = None  # MCP settings, including dynamic loaded tools
-    report_style: str = ReportStyle.ACADEMIC.value  # Report style
+    report_style: str = ReportStyle.BANK_BUSINESS_ANALYSIS.value  # Report style
     enable_deep_thinking: bool = False  # Whether to enable deep thinking
     enforce_web_search: bool = (
         False  # Enforce at least one web search step in every plan

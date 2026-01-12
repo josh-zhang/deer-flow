@@ -18,7 +18,7 @@ const DEFAULT_SETTINGS: SettingsState = {
     maxPlanIterations: 1,
     maxStepNum: 3,
     maxSearchResults: 3,
-    reportStyle: "popular_science",
+    reportStyle: "bank_business_analysis",
   },
   mcp: {
     servers: [],
@@ -36,7 +36,7 @@ export type SettingsState = {
     maxPlanIterations: number;
     maxStepNum: number;
     maxSearchResults: number;
-    reportStyle: "academic" | "popular_science" | "news" | "social_media" | "strategic_investment";
+    reportStyle: "bank_business_analysis" | "customer_service_script";
   };
   mcp: {
     servers: MCPServerMetadata[];

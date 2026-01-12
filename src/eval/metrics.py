@@ -58,46 +58,60 @@ REPORT_STYLE_SECTIONS = {
         "detailed_analysis",
         "key_citations",
     ],
-    "academic": [
-        "title",
-        "key_points",
-        "overview",
-        "detailed_analysis",
-        "literature_review",
-        "methodology",
-        "key_citations",
-    ],
-    "news": [
+    "bank_business_analysis": [
         "title",
         "key_points",
         "overview",
         "detailed_analysis",
         "key_citations",
     ],
-    "popular_science": [
+    "customer_service_script": [
         "title",
         "key_points",
         "overview",
         "detailed_analysis",
         "key_citations",
     ],
-    "social_media": [
-        "title",
-        "key_points",
-        "overview",
-        "key_citations",
-    ],
-    "strategic_investment": [
-        "title",
-        "key_points",
-        "overview",
-        "detailed_analysis",
-        "executive_summary",
-        "market_analysis",
-        "technology_analysis",
-        "investment_recommendations",
-        "key_citations",
-    ],
+    # "academic": [
+    #     "title",
+    #     "key_points",
+    #     "overview",
+    #     "detailed_analysis",
+    #     "literature_review",
+    #     "methodology",
+    #     "key_citations",
+    # ],
+    # "news": [
+    #     "title",
+    #     "key_points",
+    #     "overview",
+    #     "detailed_analysis",
+    #     "key_citations",
+    # ],
+    # "popular_science": [
+    #     "title",
+    #     "key_points",
+    #     "overview",
+    #     "detailed_analysis",
+    #     "key_citations",
+    # ],
+    # "social_media": [
+    #     "title",
+    #     "key_points",
+    #     "overview",
+    #     "key_citations",
+    # ],
+    # "strategic_investment": [
+    #     "title",
+    #     "key_points",
+    #     "overview",
+    #     "detailed_analysis",
+    #     "executive_summary",
+    #     "market_analysis",
+    #     "technology_analysis",
+    #     "investment_recommendations",
+    #     "key_citations",
+    # ],
 }
 
 # Section name patterns for detection (supports both English and Chinese)
@@ -219,11 +233,13 @@ def compute_metrics(
 def get_word_count_target(report_style: str) -> Dict[str, int]:
     """Get target word count range for a report style."""
     targets = {
-        "strategic_investment": {"min": 10000, "max": 15000},
-        "academic": {"min": 3000, "max": 8000},
-        "news": {"min": 800, "max": 2000},
-        "popular_science": {"min": 1500, "max": 4000},
-        "social_media": {"min": 500, "max": 1500},
-        "default": {"min": 1000, "max": 5000},
+        "bank_business_analysis": {"min": 1500, "max": 5000},
+        "customer_service_script": {"min": 500, "max": 2000},
+        # "strategic_investment": {"min": 10000, "max": 15000},
+        # "academic": {"min": 3000, "max": 8000},
+        # "news": {"min": 800, "max": 2000},
+        # "popular_science": {"min": 1500, "max": 4000},
+        # "social_media": {"min": 500, "max": 1500},
+        "default": {"min": 1000, "max": 3000},
     }
     return targets.get(report_style, targets["default"])
