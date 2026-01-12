@@ -8,13 +8,13 @@ from src.prompts.planner_model import StepType
 
 from .nodes import (
     analyst_node,
-    background_investigation_node,
-    coder_node,
+    # background_investigation_node,
+    # coder_node,
     coordinator_node,
     human_feedback_node,
     planner_node,
     reporter_node,
-    research_team_node,
+    # research_team_node,
     researcher_node,
 )
 from .types import State
@@ -42,8 +42,8 @@ def continue_to_running_research_team(state: State):
         return "researcher"
     if incomplete_step.step_type == StepType.ANALYSIS:
         return "analyst"
-    if incomplete_step.step_type == StepType.PROCESSING:
-        return "coder"
+    # if incomplete_step.step_type == StepType.PROCESSING:
+    #     return "coder"
     return "planner"
 
 
@@ -52,19 +52,19 @@ def _build_base_graph():
     builder = StateGraph(State)
     builder.add_edge(START, "coordinator")
     builder.add_node("coordinator", coordinator_node)
-    builder.add_node("background_investigator", background_investigation_node)
+    # builder.add_node("background_investigator", background_investigation_node)
     builder.add_node("planner", planner_node)
     builder.add_node("reporter", reporter_node)
-    builder.add_node("research_team", research_team_node)
+    # builder.add_node("research_team", research_team_node)
     builder.add_node("researcher", researcher_node)
     builder.add_node("analyst", analyst_node)
-    builder.add_node("coder", coder_node)
+    # builder.add_node("coder", coder_node)
     builder.add_node("human_feedback", human_feedback_node)
     builder.add_edge("background_investigator", "planner")
     builder.add_conditional_edges(
         "research_team",
         continue_to_running_research_team,
-        ["planner", "researcher", "analyst", "coder"],
+        ["planner", "researcher", "analyst"],
     )
     builder.add_edge("reporter", END)
     return builder

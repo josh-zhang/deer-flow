@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 class StepType(str, Enum):
     RESEARCH = "research"
     ANALYSIS = "analysis"
-    PROCESSING = "processing"
+    # PROCESSING = "processing"
 
 
 class Step(BaseModel):
@@ -30,7 +30,7 @@ class Plan(BaseModel):
     title: str
     steps: List[Step] = Field(
         default_factory=list,
-        description="Research & Processing steps to get more context",
+        description="Research step to get more context",
     )
 
     class Config:
