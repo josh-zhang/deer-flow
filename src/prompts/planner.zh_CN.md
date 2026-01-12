@@ -141,9 +141,9 @@ CURRENT_TIME: {{ CURRENT_TIME }}
 - [ ] `description`：必须指定要收集的确切信息或要执行的分析
 - [ ] `step_type`：必须是`"research"`或`"analysis"`
 
-**步骤类型分配规则：**
-- 如果`need_search`是`true` → 使用`step_type: "research"`
-- 如果`need_search`是`false`且需要推理/综合 → 使用`step_type: "analysis"`
+**步骤类型分配规则（严格执行）：**
+- 凡是需要调用 `local_search_tool` 获取信息的 -> 必须设为 `"research"`
+- 凡是只进行逻辑推理、不需要新信息的 -> 必须设为 `"analysis"`
 
 
 # 输出格式
