@@ -82,9 +82,9 @@
       "writingStyle": "对话风格",
       "chooseTitle": "选择对话风格",
       "chooseDesc": "请选择对话风格。不同风格适用于不同用途。",
-      "bank_business_analysis": "银行信用卡业务深度分析",
+      "bankBusinessAnalysis": "银行信用卡业务深度分析",
       "bankBusinessAnalysisDesc": "专注于业务分析，供内部业务专家使用",
-      "customer_service_script": "金牌客服话术",
+      "customerServiceScript": "金牌客服话术",
       "customerServiceScriptDesc": "指导一线客服回复客户"
     }
   },
