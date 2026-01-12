@@ -21,35 +21,47 @@ import { Tooltip } from "./tooltip";
 
 const REPORT_STYLES = [
   {
-    value: "academic" as const,
-    labelKey: "academic",
-    descriptionKey: "academicDesc",
+    value: "bank_business_analysis" as const,
+    labelKey: "bankBusinessAnalysis",
+    descriptionKey: "bankBusinessAnalysisDesc",
     icon: GraduationCap,
   },
   {
-    value: "popular_science" as const,
-    labelKey: "popularScience",
-    descriptionKey: "popularScienceDesc",
-    icon: FileText,
-  },
-  {
-    value: "news" as const,
-    labelKey: "news",
-    descriptionKey: "newsDesc",
-    icon: Newspaper,
-  },
-  {
-    value: "social_media" as const,
-    labelKey: "socialMedia",
-    descriptionKey: "socialMediaDesc",
-    icon: Users,
-  },
-  {
-    value: "strategic_investment" as const,
-    labelKey: "strategicInvestment",
-    descriptionKey: "strategicInvestmentDesc",
+    value: "customer_service_script" as const,
+    labelKey: "customerServiceScript",
+    descriptionKey: "customerServiceScriptDesc",
     icon: TrendingUp,
   },
+//   {
+//     value: "academic" as const,
+//     labelKey: "academic",
+//     descriptionKey: "academicDesc",
+//     icon: GraduationCap,
+//   },
+//   {
+//     value: "popular_science" as const,
+//     labelKey: "popularScience",
+//     descriptionKey: "popularScienceDesc",
+//     icon: FileText,
+//   },
+//   {
+//     value: "news" as const,
+//     labelKey: "news",
+//     descriptionKey: "newsDesc",
+//     icon: Newspaper,
+//   },
+//   {
+//     value: "social_media" as const,
+//     labelKey: "socialMedia",
+//     descriptionKey: "socialMediaDesc",
+//     icon: Users,
+//   },
+//   {
+//     value: "strategic_investment" as const,
+//     labelKey: "strategicInvestment",
+//     descriptionKey: "strategicInvestmentDesc",
+//     icon: TrendingUp,
+//   },
 ];
 
 export function ReportStyleDialog() {
@@ -58,7 +70,7 @@ export function ReportStyleDialog() {
   const currentStyle = useSettingsStore((state) => state.general.reportStyle);
 
   const handleStyleChange = (
-    style: "academic" | "popular_science" | "news" | "social_media" | "strategic_investment",
+    style: "bank_business_analysis" | "customer_service_script",
   ) => {
     setReportStyle(style);
     setOpen(false);

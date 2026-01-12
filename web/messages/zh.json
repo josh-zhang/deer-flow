@@ -82,16 +82,10 @@
       "writingStyle": "对话风格",
       "chooseTitle": "选择对话风格",
       "chooseDesc": "请选择对话风格。不同风格适用于不同用途。",
-      "academic": "知识运营",
-      "academicDesc": "正式、客观、分析性强，术语精确",
-      "popularScience": "知识查询",
-      "popularScienceDesc": "生动有趣，适合大众阅读",
-      "news": "知识质检",
-      "newsDesc": "事实、简明、公正的风格",
-      "socialMedia": "知识教学",
-      "socialMediaDesc": "简洁有趣，易于传播",
-      "strategicInvestment": "知识洞察",
-      "strategicInvestmentDesc": "深度综合分析，提供知识洞察"
+      "bank_business_analysis": "银行信用卡业务深度分析",
+      "bankBusinessAnalysisDesc": "专注于业务分析，供内部业务专家使用",
+      "customer_service_script": "金牌客服话术",
+      "customerServiceScriptDesc": "指导一线客服回复客户"
     }
   },
   "footer": {

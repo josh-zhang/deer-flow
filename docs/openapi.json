@@ -393,13 +393,13 @@
           },
           "enable_background_investigation": {
             "type": "boolean",
-            "default": true,
+            "default": false,
             "description": "Whether to get background investigation before plan"
           },
           "report_style": {
             "type": "string",
-            "enum": ["ACADEMIC", "POPULAR_SCIENCE", "NEWS", "SOCIAL_MEDIA", "STRATEGIC_INVESTMENT"],
-            "default": "ACADEMIC",
+            "enum": ["BANK_BUSINESS_ANALYSIS", "CUSTOMER_SERVICE_SCRIPT"],
+            "default": "BANK_BUSINESS_ANALYSIS",
             "description": "The style of the report"
           },
           "enable_deep_thinking": {
@@ -578,8 +578,8 @@
           },
           "report_style": {
             "type": "string",
-            "default": "academic",
-            "enum": ["academic", "ACADEMIC", "popular_science", "POPULAR_SCIENCE", "news", "NEWS", "social_media", "SOCIAL_MEDIA", "strategic_investment", "STRATEGIC_INVESTMENT"],
+            "default": "bank_business_analysis",
+            "enum": ["bank_business_analysis", "BANK_BUSINESS_ANALYSIS", "customer_service_script", "CUSTOMER_SERVICE_SCRIPT"],
             "description": "The style of the report"
           }
         }

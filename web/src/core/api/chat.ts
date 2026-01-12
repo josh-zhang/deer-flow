@@ -52,7 +52,7 @@ export async function* chatStream(
     enable_deep_thinking?: boolean;
     enable_background_investigation: boolean;
     enable_web_search?: boolean;
-    report_style?: "academic" | "popular_science" | "news" | "social_media" | "strategic_investment";
+    report_style?: "bank_business_analysis" | "customer_service_script";
     mcp_settings?: {
       servers: Record<
         string,
