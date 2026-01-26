@@ -393,7 +393,7 @@
           },
           "enable_background_investigation": {
             "type": "boolean",
-            "default": false,
+            "default": true,
             "description": "Whether to get background investigation before plan"
           },
           "report_style": {
