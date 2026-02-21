@@ -1,14 +1,18 @@
-# Python-generated files
+# DeerFlow docker image cache
+docker/.cache/
+# OS generated files
+.DS_Store
+*.local
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Python cache
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-.coverage
-.coverage.*
-agent_history.gif
-static/browser_history/*.gif
+*.pyc
+*.pyo
 
 # Virtual environments
 .venv
@@ -17,16 +21,28 @@ venv/
 # Environment variables
 .env
 
-# user conf
-conf.yaml
+# Configuration files
+config.yaml
+mcp_config.json
+extensions_config.json
 
+# IDE
 .idea/
-.langgraph_api/
-.DS_Store
 
-# coverage report
+# Coverage report
 coverage.xml
 coverage/
+.deer-flow/
+.claude/
+skills/custom/*
+logs/
 
-# Temporary PPT content files
-ppt_content_*.md
+# Local git hooks (keep only on this machine, do not push)
+.githooks/
+
+# pnpm
+.pnpm-store
+sandbox_image_cache.tar
+
+# ignore the legacy `web` folder
+web/
