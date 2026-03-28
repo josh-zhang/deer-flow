@@ -46,3 +46,6 @@ class State(MessagesState):
 
     # Workflow control
     goto: str = "planner"  # Default next node
+
+    # 建议新增字段：
+    replanning_needed: bool = False # 核心：用于 Analyst 信号反馈

@@ -9,12 +9,9 @@ from src.prompts.planner_model import StepType
 from .nodes import (
     analyst_node,
     background_investigation_node,
-    coder_node,
     coordinator_node,
-    human_feedback_node,
     planner_node,
     reporter_node,
-    research_team_node,
     researcher_node,
 )
 from .types import State
@@ -42,30 +39,39 @@ def continue_to_running_research_team(state: State):
         return "researcher"
     if incomplete_step.step_type == StepType.ANALYSIS:
         return "analyst"
-    # if incomplete_step.step_type == StepType.PROCESSING:
-    #     return "coder"
     return "planner"
 
 
 def _build_base_graph():
-    """Build and return the base state graph with all nodes and edges."""
     builder = StateGraph(State)
-    builder.add_edge(START, "coordinator")
+    builder.add_edge(START, "coordinator")  # 包含需求澄清
     builder.add_node("coordinator", coordinator_node)
     builder.add_node("background_investigator", background_investigation_node)
     builder.add_node("planner", planner_node)
-    builder.add_node("reporter", reporter_node)
-    builder.add_node("research_team", research_team_node)
+
+    # 细化执行循环
     builder.add_node("researcher", researcher_node)
+    builder.add_node("rule_splitter", rule_splitter_node)
+    builder.add_node("arbitrator", arbitrator_node)
     builder.add_node("analyst", analyst_node)
-    # builder.add_node("coder", coder_node)
-    builder.add_node("human_feedback", human_feedback_node)
+    builder.add_node("reporter", reporter_node)
+
+    builder.add_edge("coordinator", "background_investigator")
     builder.add_edge("background_investigator", "planner")
-    builder.add_conditional_edges(
-        "research_team",
-        continue_to_running_research_team,
-        ["planner", "researcher", "analyst"],
-    )
+
+    # 规划器决定下一步是检索还是分析
+    builder.add_conditional_edges("planner", route_from_planner, ["researcher", "arbitrator"])
+
+    # 检索后直接接拆分，拆分完判断是否需要继续检索还是分析
+    builder.add_edge("researcher", "rule_splitter")
+    builder.add_conditional_edges("rule_splitter", route_from_splitter, ["researcher", "arbitrator"])
+
+    # 所有检索和拆分完成后，进行仲裁，然后分析，最后出报告
+    builder.add_edge("arbitrator", "analyst")
+
+    # 增加动态Replanning机制，如果analyst发现缺失信息，进行重新规划
+    builder.add_conditional_edges("analyst", route_from_analyst, ["reporter", "planner"])
+
     builder.add_edge("reporter", END)
     return builder
 
