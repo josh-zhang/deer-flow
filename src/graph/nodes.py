@@ -289,7 +289,7 @@ async def rule_splitter_node(state: State, config: RunnableConfig) -> dict:
     # 模拟构建拆分专家的 Prompt
     messages = [
         SystemMessage(
-            content="你是民生银行信用卡业务规则原子处理专家。请严格按照要求，将以下检索到的文档片段拆分为清晰的原子规则(IF-THEN 格式)。"),
+            content="你是中信银行信用卡业务规则原子处理专家。请严格按照要求，将以下检索到的文档片段拆分为清晰的原子规则(IF-THEN 格式)。"),
         HumanMessage(content=f"## 待处理信息：\n{latest_obs}")
     ]
 
@@ -349,7 +349,7 @@ async def analyst_node(state: State, config: RunnableConfig) -> dict:
 
     messages = [
         SystemMessage(
-            content="你是民生银行信用卡业务分析专家。请基于用户原始问题和《矛盾信息仲裁报告》，进行综合推理并给出确切结论。如果发现信息严重缺失无法得出结论，请在报告末尾明确输出 JSON 标记 `{\"replanning_needed\": true}`。"),
+            content="你是中信银行信用卡业务分析专家。请基于用户原始问题和《矛盾信息仲裁报告》，进行综合推理并给出确切结论。如果发现信息严重缺失无法得出结论，请在报告末尾明确输出 JSON 标记 `{\"replanning_needed\": true}`。"),
         HumanMessage(content=f"## 调查原始问题：\n{original_question}\n\n## 矛盾信息仲裁报告：\n{arbitration_result}")
     ]
 
@@ -383,7 +383,7 @@ def reporter_node(state: State, config: RunnableConfig) -> dict:
     # Format the prompt exactly as required by the Report Structure image
     input_messages = [
         SystemMessage(
-            content="你是一位拥有多年从业经验的民生银行信用卡业务专家。任务是针对“调查原始问题”，利用“analyst task observations”和“可用参考来源”生成最终业务报告。严格遵守 Markdown 格式，不捏造 URL。"),
+            content="你是一位拥有多年从业经验的中信银行信用卡业务专家。任务是针对“调查原始问题”，利用“analyst task observations”和“可用参考来源”生成最终业务报告。严格遵守 Markdown 格式，不捏造 URL。"),
         HumanMessage(
             content=f"### 调查原始问题\n{original_question}\n\n### Analyst Observations (核心结论与风险提示)\n{analyst_observations}")
     ]
