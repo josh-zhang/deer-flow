@@ -144,3 +144,66 @@ def curator_node(state: dict) -> dict:
             step_idx: build_searcher_view(curator_output),
         },
     }
+
+def run_step(state, step):
+    # 运行 Searcher agent（不变）
+    searcher_result = searcher_agent.invoke(build_searcher_input(state, step))
+    searcher_output_text = searcher_result.content  # 现在是轻量注释
+
+    # -------- 新增：提取原始工具返回 --------
+    tool_returns = extract_tool_returns(searcher_result.messages)
+    formatted_tool_returns = format_tool_returns(tool_returns)
+    # -----------------------------------------
+
+    # 把 Searcher 注释 + 原始工具返回 一起喂给 Curator
+    curator_result = curator_llm.invoke([
+        {"role": "system", "content": CURATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": build_curator_input(
+            step=step,
+            searcher_annotations=searcher_output_text,   # 轻量注释
+            raw_tool_returns=formatted_tool_returns,      # 一手数据
+        )},
+    ])
+    return curator_result
+
+
+def extract_tool_returns(messages: list) -> list[dict]:
+    """从 Searcher 的消息历史中提取所有工具返回"""
+    results = []
+    call_counter = {}
+    for msg in messages:
+        if msg.type == "tool":
+            tool_name = msg.name  # "local_search_tool" / "fetch_tool" / "crawl_tool"
+            call_counter[tool_name] = call_counter.get(tool_name, 0) + 1
+            results.append({
+                "round_id": f"{tool_name}_{call_counter[tool_name]}",
+                "tool_name": tool_name,
+                "content": msg.content,
+            })
+    return results
+
+
+def format_tool_returns(tool_returns: list[dict]) -> str:
+    """将工具返回格式化为 Curator 可读的文本"""
+    sections = []
+    for tr in tool_returns:
+        sections.append(f"### {tr['round_id']}\n\n{tr['content']}")
+    return "\n\n---\n\n".join(sections)
+
+
+def build_curator_input(step, searcher_annotations, raw_tool_returns) -> str:
+    return f"""## 调查原始问题
+{step['question']}
+
+## 当前步骤
+- title: {step['title']}
+- background: {step['background']}
+- description: {step['description']}
+
+## Searcher 检索注释
+{searcher_annotations}
+
+## 原始工具返回结果
+（以下为 Searcher 各轮工具调用的原始返回，Searcher 已在上方注释中标注了哪些结果可能相关。）
+
+{raw_tool_returns}"""
