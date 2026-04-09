@@ -51,11 +51,8 @@ def parse_curator_output(text: str) -> CuratorOutput:
     output.indirect_count = sum(
         1 for e in output.evidences if e.relevance == Relevance.INDIRECT
     )
-    output.uncertain_high_count = sum(
-        1 for e in output.evidences if e.relevance == Relevance.UNCERTAIN_HIGH
-    )
-    output.uncertain_low_count = sum(
-        1 for e in output.evidences if e.relevance == Relevance.UNCERTAIN_LOW
+    output.uncertain_count = sum(
+        1 for e in output.evidences if e.relevance == Relevance.UNCERTAIN
     )
 
     # discarded_count：尝试从 discarded 文本中计数表格行
