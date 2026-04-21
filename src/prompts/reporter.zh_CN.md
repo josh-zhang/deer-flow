@@ -18,9 +18,9 @@
 
 客户的具体业务诉求。
 
-## 2. 工作流类型
+## 2. 调查计划制定思路
 
-当前为 **`{{ workflow_type }}`（{% if workflow_type == "A" %}定点调查{% elif workflow_type == "B" %}并行对比{% elif workflow_type == "C" %}扫描穷举{% elif workflow_type == "D" %}条件推理{% endif %}）**。
+用来了解调查过程。
 
 ## 3. Analyst 的 observations
 
@@ -154,8 +154,8 @@
 
 [基于 overall_confidence 和 uncovered_aspects 生成：]
 - overall_confidence = sufficient → "以上信息已基于多份业务文档交叉验证。"
-- overall_confidence = partial → "以上部分结论的依据来源有限，建议坐席在回复客户时留有余地，如客户追问可转接上级。"
-- overall_confidence = insufficient → "以上信息尚不充分，建议坐席不要直接给出确定性结论，优先引导客户联系专属客户经理或拨打热线进一步确认。"
+- overall_confidence = partial → "以上部分结论的依据来源有限，建议用户额外查阅参考来源进行信息验证。"
+- overall_confidence = insufficient → "以上信息尚不充分，用户必须额外查阅参考来源进行信息验证。"
 
 [如有 uncovered_aspects：]
 - 以下方面在知识库中未查到相关信息：[逐项列出]
@@ -230,7 +230,13 @@
 
 ### 五、信息局限性说明
 
-[同工作流 A 的局限性说明逻辑。]
+[基于 overall_confidence 和 uncovered_aspects 生成：]
+- overall_confidence = sufficient → "以上信息已基于多份业务文档交叉验证。"
+- overall_confidence = partial → "以上部分结论的依据来源有限，建议用户额外查阅参考来源进行信息验证。"
+- overall_confidence = insufficient → "以上信息尚不充分，用户必须额外查阅参考来源进行信息验证。"
+
+[如有 uncovered_aspects：]
+- 以下方面在知识库中未查到相关信息：[逐项列出]
 
 ---
 
@@ -361,7 +367,7 @@
 ### 三、判定依据
 
 [从 analysis_text 的推理过程中提取关键规则和推理链条。]
-[使用坐席易理解的语言，保留核心规则引用。]
+[使用业务人员易理解的语言，保留核心规则引用。]
 
 **适用规则：**
 - [规则1简述]（来源：《文档名》）
@@ -386,7 +392,13 @@
 
 ### 五、信息局限性说明
 
-[同工作流 A 的局限性说明逻辑。]
+[基于 overall_confidence 和 uncovered_aspects 生成：]
+- overall_confidence = sufficient → "以上信息已基于多份业务文档交叉验证。"
+- overall_confidence = partial → "以上部分结论的依据来源有限，建议用户额外查阅参考来源进行信息验证。"
+- overall_confidence = insufficient → "以上信息尚不充分，用户必须额外查阅参考来源进行信息验证。"
+
+[如有 uncovered_aspects：]
+- 以下方面在知识库中未查到相关信息：[逐项列出]
 
 ---
 
@@ -411,12 +423,12 @@
 当 Analyst 给出 `insufficient` 置信度时（通常出现在强制输出情境），报告需要特殊处理：
 
 - 在"结论摘要"中明确表述："**目前可查到的信息不足以给出确定结论**，以下为基于有限信息的初步判断，仅供参考。"
-- 在"信息局限性说明"中强化提示："建议坐席**不要**直接给出确定性结论，优先引导客户联系专属客户经理或拨打 400 服务热线进一步确认。"
+- 在"信息局限性说明"中强化提示："建议用户**不要**直接采信结论，必须额外查阅参考来源进行信息验证。"
 - 全文使用谨慎措辞，避免任何绝对化表述。
 
 ## 2. uncovered_aspects 非空
 
-将 `uncovered_aspects` 中的每一项转化为坐席可理解的表述：
+将 `uncovered_aspects` 中的每一项转化为业务人员可理解的表述：
 
 ```
 ❌ 系统话术："费率表未覆盖"
@@ -427,7 +439,7 @@
 
 如果 Analyst 发现了未仲裁的矛盾：
 
-- 在"重要提示"中标注："**关于[矛盾主题]，现有资料中存在不一致的信息，尚未确认以哪个为准。** 建议坐席在回复客户时避免涉及此项具体数值，如客户追问，建议转接上级处理。"
+- 在"重要提示"中标注："**关于[矛盾主题]，现有资料中存在不一致的信息，尚未确认以哪个为准。**"
 
 # 输出格式
 
