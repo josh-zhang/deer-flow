@@ -468,7 +468,6 @@ interface Plan {
 
 **验证清单 — Plan 级别字段：**
 - [ ] `thought`：必须包含制定思路{% if workflow_type == "D" %}及缺失条件识别过程{% endif %}
-
 - [ ] `title`：必须有计划标题
 - [ ] `workflow_type`：填 `"{{ workflow_type }}"`，但可以 Override（例如：当前指定的工作流类型为 A 但你认为应该是 B）
 - [ ] `missing_conditions`：必须列出缺失条件（非工作流 D 必须填 `[]`）
