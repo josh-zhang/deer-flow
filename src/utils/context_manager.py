@@ -4,7 +4,7 @@ import json
 import logging
 from typing import List
 
-from langgraph.runtime import Runtime
+from langgraph.runtime import Runtime 
 
 from langchain_core.messages import (
     AIMessage,
@@ -191,7 +191,7 @@ class ContextManager:
         Compress messages to fit within token limit through two strategies:
         1. First, compress web_search ToolMessage raw_content by truncating to 1024 chars
         2. If still over limit, drop oldest messages while preserving prefix messages and system messages
-
+        
         Args:
             messages: List of messages to compress
         Returns:
@@ -199,7 +199,7 @@ class ContextManager:
         """
         # Create a deep copy to avoid mutating original messages
         compressed = copy.deepcopy(messages)
-
+        
         # Step 1: Compress raw_content in web_search ToolMessages
         for msg in compressed:
             # Only compress ToolMessage with name 'web_search'
@@ -211,12 +211,11 @@ class ContextManager:
                         # A heuristic: if string is less than 2KB, raw_content likely doesn't need truncation
                         if len(msg.content) < 2048:
                             continue
-
+                        
                         try:
                             content_data = json.loads(msg.content)
                         except json.JSONDecodeError as e:
-                            logger.error(
-                                f"Failed to parse JSON content in web_search ToolMessage: {e}. Content: {msg.content[:200]}")
+                            logger.error(f"Failed to parse JSON content in web_search ToolMessage: {e}. Content: {msg.content[:200]}")
                             continue
                     elif isinstance(msg.content, list):
                         content_data = copy.deepcopy(msg.content)
@@ -233,7 +232,7 @@ class ContextManager:
                                 if raw_content and isinstance(raw_content, str) and len(raw_content) > 1024:
                                     item["raw_content"] = raw_content[:1024]
                                     modified = True
-
+                        
                         # Update message content with modified data only if changes were made
                         if modified:
                             msg.content = json.dumps(content_data, ensure_ascii=False)
@@ -248,14 +247,14 @@ class ContextManager:
             preserved_count = self.preserve_prefix_message_count
             preserved_messages = compressed[:preserved_count]
             remaining_messages = compressed[preserved_count:]
-
+            
             # Drop messages from the middle, keeping the most recent ones
             result_messages = preserved_messages
             for msg in reversed(remaining_messages):
                 result_messages.insert(len(preserved_messages), msg)
                 if not self.is_over_limit(result_messages):
                     break
-
+            
             compressed = result_messages
 
         # Step 3: Verify that compression was successful and log warning if needed
@@ -287,17 +286,17 @@ class ContextManager:
 def validate_message_content(messages: List[BaseMessage], max_content_length: int = 100000) -> List[BaseMessage]:
     """
     Validate and fix all messages to ensure they have valid content before sending to LLM.
-
+    
     This function ensures:
     1. All messages have a content field
     2. No message has None or empty string content (except for legitimate empty responses)
     3. Complex objects (lists, dicts) are converted to JSON strings
     4. Content is truncated if too long to prevent token overflow
-
+    
     Args:
         messages: List of messages to validate
         max_content_length: Maximum allowed content length per message (default 100000)
-
+    
     Returns:
         List of validated messages with fixed content
     """
@@ -308,29 +307,27 @@ def validate_message_content(messages: List[BaseMessage], max_content_length: in
             if not hasattr(msg, 'content'):
                 logger.warning(f"Message {i} ({type(msg).__name__}) has no content attribute")
                 msg.content = ""
-
+            
             # Handle None content
             elif msg.content is None:
                 logger.warning(f"Message {i} ({type(msg).__name__}) has None content, setting to empty string")
                 msg.content = ""
-
+            
             # Handle complex content types (convert to JSON)
             elif isinstance(msg.content, (list, dict)):
-                logger.debug(
-                    f"Message {i} ({type(msg).__name__}) has complex content type {type(msg.content).__name__}, converting to JSON")
+                logger.debug(f"Message {i} ({type(msg).__name__}) has complex content type {type(msg.content).__name__}, converting to JSON")
                 msg.content = json.dumps(msg.content, ensure_ascii=False)
-
+            
             # Handle other non-string types
             elif not isinstance(msg.content, str):
-                logger.debug(
-                    f"Message {i} ({type(msg).__name__}) has non-string content type {type(msg.content).__name__}, converting to string")
+                logger.debug(f"Message {i} ({type(msg).__name__}) has non-string content type {type(msg.content).__name__}, converting to string")
                 msg.content = str(msg.content)
-
+            
             # Validate content length
             if isinstance(msg.content, str) and len(msg.content) > max_content_length:
                 logger.warning(f"Message {i} content truncated from {len(msg.content)} to {max_content_length} chars")
                 msg.content = msg.content[:max_content_length].rstrip() + "..."
-
+            
             validated.append(msg)
         except Exception as e:
             logger.error(f"Error validating message {i}: {e}")
@@ -340,6 +337,6 @@ def validate_message_content(messages: List[BaseMessage], max_content_length: in
             else:
                 msg.content = f"[Error processing message: {str(e)}]"
             validated.append(msg)
-
+    
     return validated
 
