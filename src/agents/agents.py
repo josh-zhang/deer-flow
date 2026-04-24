@@ -33,9 +33,7 @@ class DynamicPromptMiddleware(AgentMiddleware):
         """Apply prompt template and prepend system message to messages."""
         try:
             # Get the rendered messages including system prompt from template
-            rendered_messages = apply_prompt_template(
-                self.prompt_template, state, locale=self.locale
-            )
+            rendered_messages = apply_prompt_template(self.prompt_template, state)
             # The first message is the system prompt, extract it
             if rendered_messages and len(rendered_messages) > 0:
                 system_message = rendered_messages[0]

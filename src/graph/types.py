@@ -25,7 +25,7 @@ from typing import Annotated, Any
 
 from langgraph.graph import MessagesState
 
-from src.prompts.planner_model import Plan
+from src.graph.planner_model import Plan
 from src.rag import Resource
 
 
@@ -36,7 +36,8 @@ class State(MessagesState):
     #  Coordinator Output
     # ═══════════════════════════════════════════════════
     research_topic: str = ""
-    clarified_research_topic: str = ""
+    original_topic: str = "" # use to keep original query user provided
+    clarified_research_topic: str = "" # use to keep clarified query for researcher
     workflow_type: str = "A"          # A / B / C / D
     workflow_confidence: str = "high"  # high / medium / low
 
@@ -64,9 +65,12 @@ class State(MessagesState):
     #  Planner
     # ═══════════════════════════════════════════════════
     current_plan: Plan | None = None
+    current_plan_last_round: Plan | None = None # use to keep last round plan for replan
     missing_conditions: list[str] = field(default_factory=list)  # workflow D
     plan_iterations: int = 0
-    max_plan_iterations: int = 3
+    max_plan_iterations: int = 3 # used for counting creating plan based on human feedback, not for replan
+    replan_iterations: int = 0 # used for counting replan iterations
+    last_plan_text: str = ""  # last planner raw JSON / text for replan context
 
     # ═══════════════════════════════════════════════════
     #  Plan Validation — Layer 1 (Override) + Layer 2 (Structure)
@@ -76,48 +80,30 @@ class State(MessagesState):
     # ═══════════════════════════════════════════════════
     planner_override_occurred: bool = False
     structure_validation_retried: bool = False
-
-    # ═══════════════════════════════════════════════════
-    #  Step Execution Tracking
-    #
-    #  current_step_index: 当前 plan 中已完成的 research step 数量。
-    #  每完成一个 research step（rule_splitter 输出后），递增 1。
-    #  新 plan 生成时（含 replan）重置为 0。
-    # ═══════════════════════════════════════════════════
-    current_step_index: int = 0
+    _plan_validator_needs_rerun: bool = False
+    skip_next_plan_iteration_increment: bool = False
 
     # ═══════════════════════════════════════════════════
     #  Searcher Output — 跨步骤 & 跨迭代累积
     #
-    #  searcher_results:   每个 research step 的原始工具返回 + 检索注释
-    #  searcher_summaries: 精简摘要，供后续 Searcher 参考已有线索
+    #  searcher_results:   每个 research step 的原始工具返回，供后续 curator 提取相关信息
+    #  searcher_summaries: 检索注释，供后续 Searcher 参考已有线索
     # ═══════════════════════════════════════════════════
-    searcher_results: Annotated[list[str], operator.add] = field(
-        default_factory=list
-    )
-    searcher_summaries: Annotated[list[str], operator.add] = field(
-        default_factory=list
-    )
+    # 整表替换：planner / replan 时重置，节点返回完整列表
+    searcher_results: list[str] = field(default_factory=list)
+    searcher_summaries: list[str] = field(default_factory=list)
 
     # ═══════════════════════════════════════════════════
     #  Evidence Curator Output — 跨步骤 & 跨迭代累积
     #
-    #  curator_analysis_views:      分析视图 → Analyst + Reporter
-    #  curator_rule_splitter_views: 完整视图 → Rule Splitter
+    #  curator_rule_splitter_views: 完整视图 → Rule Splitter （注意execution_res存放分析视图 → Analyst）
     # ═══════════════════════════════════════════════════
-    curator_analysis_views: Annotated[list[str], operator.add] = field(
-        default_factory=list
-    )
-    curator_rule_splitter_views: Annotated[list[str], operator.add] = field(
-        default_factory=list
-    )
+    curator_rule_splitter_views: list[str] = field(default_factory=list)
 
     # ═══════════════════════════════════════════════════
     #  Rule Splitter Output — 跨步骤 & 跨迭代累积
     # ═══════════════════════════════════════════════════
-    atomic_rules: Annotated[list[str], operator.add] = field(
-        default_factory=list
-    )
+    atomic_rules: list[str] = field(default_factory=list)
 
     # ═══════════════════════════════════════════════════
     #  Arbitrator Output
@@ -131,10 +117,12 @@ class State(MessagesState):
     #  analyst_output:     完整结构化 JSON（含 conclusions, analysis_text 等）
     #  replanning_needed:  由 Analyst 设置，驱动 route_from_analyst
     #  replanning_reason:  Analyst 说明缺失信息和建议方向
+    #  observations:       Analyst 的观察结果，供后续 Reporter 参考
     # ═══════════════════════════════════════════════════
     analyst_output: dict[str, Any] = field(default_factory=dict)
     replanning_needed: bool = False
     replanning_reason: str = ""
+    observations: list[str] = field(default_factory=list)
 
     # ═══════════════════════════════════════════════════
     #  Reporter Output — 最终交付物
@@ -152,3 +140,6 @@ class State(MessagesState):
     #  UI / Compat
     # ═══════════════════════════════════════════════════
     auto_accepted_plan: bool = False
+
+    # workflow control
+    goto:str = "planner"

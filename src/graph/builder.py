@@ -13,23 +13,23 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
 
-from .state import State
-from .nodes import (
+from src.graph.types import State
+from src.graph.nodes import (
     coordinator_node,
     background_investigation_node,
+    human_feedback_node,
     planner_node,
     plan_validator_node,
-    searcher_node,
-    evidence_curator_node,
+    researcher_node,
+    curator_node,
     rule_splitter_node,
     arbitrator_node,
     analyst_node,
     reporter_node,
 )
-from .prompt_utils import get_research_steps
-
 logger = logging.getLogger(__name__)
 
 
@@ -43,10 +43,11 @@ def _build_base_graph() -> StateGraph:
     # ── Register Nodes ──
     builder.add_node("coordinator", coordinator_node)
     builder.add_node("background_investigator", background_investigation_node)
+    builder.add_node("human_feedback", human_feedback_node)
     builder.add_node("planner", planner_node)
     builder.add_node("plan_validator", plan_validator_node)  # NEW
-    builder.add_node("searcher", searcher_node)
-    builder.add_node("evidence_curator", evidence_curator_node)
+    builder.add_node("researcher", researcher_node)
+    builder.add_node("curator", curator_node)
     builder.add_node("rule_splitter", rule_splitter_node)
     builder.add_node("arbitrator", arbitrator_node)
     builder.add_node("analyst", analyst_node)
@@ -54,11 +55,12 @@ def _build_base_graph() -> StateGraph:
 
     # ── Fixed Edges ──
     builder.add_edge(START, "coordinator")
-    builder.add_edge("coordinator", "background_investigator")
+    # coordinator 到 background_investigator 通过node.py代码跳跃
     builder.add_edge("background_investigator", "planner")
-    builder.add_edge("planner", "plan_validator")  # CHANGED: was planner → conditional
-    builder.add_edge("searcher", "evidence_curator")
-    builder.add_edge("evidence_curator", "rule_splitter")
+    # planner 到 human_feedback 需要node.py的代码进行用户交付确认
+    builder.add_edge("human_feedback", "plan_validator")
+    builder.add_edge("researcher", "curator")
+    builder.add_edge("curator", "rule_splitter")
     builder.add_edge("arbitrator", "analyst")
     builder.add_edge("reporter", END)
 
@@ -66,21 +68,21 @@ def _build_base_graph() -> StateGraph:
 
     # plan_validator 三出口:
     #   planner    — Override 或结构校验失败，需重新规划
-    #   searcher   — 校验通过，开始第一个 research step
+    #   researcher   — 校验通过，开始第一个 research step
     #   arbitrator — 校验通过但无 research step（理论上不应出现）
     builder.add_conditional_edges(
         "plan_validator",
         route_from_validator,
-        ["planner", "searcher", "arbitrator"],
+        ["planner", "researcher", "arbitrator"],
     )
 
     # rule_splitter 双出口:
-    #   searcher   — 还有未完成的 research step
+    #   researcher   — 还有未完成的 research step
     #   arbitrator — 所有 research step 已完成
     builder.add_conditional_edges(
         "rule_splitter",
         route_from_splitter,
-        ["searcher", "arbitrator"],
+        ["researcher", "arbitrator"],
     )
 
     # analyst 双出口:
@@ -95,11 +97,21 @@ def _build_base_graph() -> StateGraph:
     return builder
 
 
+def build_graph():
+    """编译调查流水线图（无 checkpointer，适合一次性脚本）。"""
+    return _build_base_graph().compile()
+
+
+def build_graph_with_memory():
+    """带内存 checkpointer，供 API / 多轮会话使用 thread_id 恢复状态。"""
+    return _build_base_graph().compile(checkpointer=MemorySaver())
+
+
 # ─────────────────────────────────────────────
 #  Routing Functions
 # ─────────────────────────────────────────────
 
-def route_from_validator(state: State) -> Literal["planner", "searcher", "arbitrator"]:
+def route_from_validator(state: State) -> Literal["planner", "researcher", "arbitrator"]:
     """
     plan_validator 的出口路由。
 
@@ -110,30 +122,28 @@ def route_from_validator(state: State) -> Literal["planner", "searcher", "arbitr
     """
     plan = state.get("current_plan")
 
-    # ── Layer 1: Override 需要重跑 ──
-    if plan is not None and hasattr(plan, "workflow_type"):
-        planner_type = getattr(plan, "workflow_type", state["workflow_type"])
-        current_type = state["workflow_type"]
-        # 如果 plan 声明的类型与 state 中的不同，且 validator 刚设置了 override 标志
-        if planner_type != current_type and not state.get("planner_override_occurred", False):
-            # 注意：此分支理论上不应命中，因为 plan_validator_node 已在 override 时
-            # 更新了 state["workflow_type"]。作为防御性保留。
-            return "planner"
-
-    # ── Layer 2: 结构校验失败需要重跑 ──
-    # plan_validator_node 通过设置 workflow_type="A" + structure_validation_retried=True 来信号
-    # 这里通过一个简单的标志判断
+    # ── Layer 1+2: validator 节点要求重跑 planner ──
     if state.get("_plan_validator_needs_rerun", False):
         return "planner"
 
-    # ── 正常路由 ──
-    research_steps = get_research_steps(plan)
-    if research_steps:
-        return "searcher"
-    return "arbitrator"
+    if plan is None or not getattr(plan, "steps", None):
+        return "planner"
 
+    goto = "reporter"
 
-def route_from_splitter(state: State) -> Literal["searcher", "arbitrator"]:
+    # only when step.execution_res got value, the step is considered as completed
+    for step in plan.steps:
+        if not step.execution_res:
+            if getattr(step, "step_type", "") == "research":
+                goto = "researcher"
+                break
+            elif getattr(step, "step_type", "") == "analysis":
+                goto = "arbitrator"
+                break
+    
+    return goto
+
+def route_from_splitter(state: State) -> Literal["researcher", "arbitrator"]:
     """
     rule_splitter 完成后的路由。
 
@@ -142,13 +152,21 @@ def route_from_splitter(state: State) -> Literal["searcher", "arbitrator"]:
     - 否则 → arbitrator 汇总仲裁
     """
     plan = state.get("current_plan")
-    research_steps = get_research_steps(plan)
-    current_idx = state.get("current_step_index", 0)
+    if plan is None or not getattr(plan, "steps", None):
+        return "arbitrator"
 
-    if current_idx < len(research_steps):
-        return "searcher"
+    in_completed_step = None
+    for step in plan.steps:
+        if not step.execution_res:
+            in_completed_step = step
+            break
+    if not in_completed_step:
+        return "arbitrator"
+    
+    if in_completed_step.step_type == "research":
+        return "researcher"
+
     return "arbitrator"
-
 
 def route_from_analyst(state: State) -> Literal["reporter", "planner"]:
     """
@@ -158,11 +176,11 @@ def route_from_analyst(state: State) -> Literal["reporter", "planner"]:
     - 否则 → reporter（最终报告）
     """
     if state.get("replanning_needed", False):
-        plan_iterations = state.get("plan_iterations", 0)
-        max_iterations = state.get("max_plan_iterations", 3)
-        if plan_iterations < max_iterations:
+        replan_it = state.get("replan_iterations", 0)
+        max_replan = 3
+        if replan_it < max_replan:
             logger.info(
-                f"Analyst triggered replan (iteration {plan_iterations}/{max_iterations}). "
+                f"Analyst triggered replan (replan_iterations={replan_it}/{max_replan}). "
                 f"Reason: {state.get('replanning_reason', 'N/A')}"
             )
             return "planner"
