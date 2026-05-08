@@ -469,6 +469,25 @@ def planner_node(state: State, config: RunnableConfig) -> Command:
             }
         ]
 
+        replan_section = ""
+        if is_replan:
+            findings_text = "\n".join(f"- {f}" for f in existing_findings) if existing_findings else "无"
+            replan_section = f"""
+    ## ⚠️ 重新规划（Replan）
+
+    **原因**: {replanning_reason}
+
+    **上一轮计划**:
+    ```
+    {last_plan_text}
+    ```
+
+    **已有发现**:
+    {findings_text}
+
+    **要求**: 针对缺失信息设计补充调研步骤，避免重复已完成的检索。
+    """
+
     llm = get_llm_by_type(AGENT_LLM_MAP.get("planner", "basic"))
     full_response = ""
     for chunk in llm.stream(messages):
