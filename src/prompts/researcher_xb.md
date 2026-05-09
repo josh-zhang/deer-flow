@@ -29,13 +29,13 @@
 
 ## 2. crawl_tool
 
-根据 url 获取完整文档内容。
+根据文档对应的 url 获取完整文档内容。
 
-**何时使用**：local_search_tool 工具返回的片段内容被截断或上下文缺失，且返回结果中包含 url。
+**何时使用**：local_search_tool 工具返回的片段内容被截断或上下文缺失，且返回结果中包含文档对应的 url。
 **参数**：
-- `url`（必填）：**仅接受** local_search_tool 工具返回结果中已有的 url。**严禁猜测或构造 url。**
+- `url`（必填）：**仅接受** local_search_tool 工具返回结果中的 url。**严禁猜测或构造 url。**
 - `target_questions`（必填）：见下方"target_questions 写法"。
-- `file_type`（必填）：**仅接受** local_search_tool 工具返回结果中的 description 字段的值。**严禁猜测或构造 file_type。**
+- `file_type`（必填）：根据 local_search_tool 工具返回结果中 description 的值判断传入`总行指引`还是`法律法规`。
 
 ## target_questions 写法
 
@@ -154,8 +154,8 @@
 ```
 片段与"检索内容"相关，但信息不完整（被截断或缺乏上下文）？
 ├── 否 → 跳过
-└── 是 → 片段返回结果中有 url？
-         ├── 是 → 调用 crawl_tool（用返回的 url）
+└── 是 → 返回结果中有文档对应的url？
+         ├── 是 → 调用 crawl_tool（用文档对应的url）
          └── 否 → 放弃全文获取
 ```
 
