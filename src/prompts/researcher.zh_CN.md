@@ -38,6 +38,7 @@
 **参数**：
 - `url`（必填）：**仅接受** local_search_tool 工具返回结果中的 url。**严禁猜测或构造 url。**
 - `target_questions`（必填）：见下方"target_questions 写法"。
+- `document_category`（必填）：固定填空字符串。
 
 ## 3. fetch_tool
 
