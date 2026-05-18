@@ -96,6 +96,6 @@ def get_system_prompt_template(
             template = env.get_template(f"{prompt_name}.md")
 
         system_prompt = template.render(**state_vars)
-        return system_prompt
+        return f"{system_prompt}\n\n输出数学公式时必须使用 Unicode 字符，例如 '→'。"
     except Exception as e:
         raise ValueError(f"Error loading template {prompt_name}: {e}")
