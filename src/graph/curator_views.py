@@ -59,9 +59,23 @@ def _format_evidence_for_analyst(e: EvidenceItem) -> str:
 
 
 def generate_analysis_view(output: CuratorOutput) -> str:
-    """Analyst 视图：直接相关含全文，其余仅 metadata。"""
-    parts = []
+    """Analyst 视图：直接相关含全文，其余仅 metadata + 统计概览。"""
+    parts: list[str] = []
 
+    # ── 统计概览（新增）──
+    stats = (
+        f"共保留 {output.retained_count} 条依据"
+        f"（直接相关 {output.direct_count}，"
+        f"间接相关 {output.indirect_count}，"
+        f"存疑 {output.uncertain_count}）"
+    )
+    if output.expired_count > 0:
+        stats += f"，其中 {output.expired_count} 条已过期"
+    if output.tool_extracted_count > 0:
+        stats += f"，{output.tool_extracted_count} 条为工具截取"
+    parts.append(f"【依据统计】{stats}。")
+
+    # ── 以下不变 ──
     parts.append(f"\n【评估基准】\n{output.evaluation_basis}")
 
     parts.append("\n【相关业务依据清单】")
@@ -80,18 +94,58 @@ def generate_analysis_view(output: CuratorOutput) -> str:
 # 视图 2: 完整视图 → Rule Splitter
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def generate_full_view(output: CuratorOutput) -> str:
-    """Rule Splitter 视图：所有 evidence 完整输出。"""
-    parts = []
+def generate_rule_splitter_view(
+    output: CuratorOutput,
+    resolved_list: list[ResolvedEvidence] | None = None,
+) -> str:
+    """
+    Rule Splitter 完整视图。
 
-    parts.append(f"\n## 评估基准\n{output.evaluation_basis}")
+    两种模式：
+    - 有 resolved_list：用 chunk_map 原文替换 Curator 精简后的具体内容
+      → Rule Splitter 拿到的是未经 Curator 精简的完整段落原文
+    - 无 resolved_list：回退到 Curator body 原始内容（向后兼容）
+    """
+    parts: list[str] = []
 
+    # ── 评估基准 ──
+    parts.append(f"## 评估基准\n\n{output.evaluation_basis}")
+
+    # ── 相关业务依据清单 ──
     parts.append("\n## 相关业务依据清单")
-    for e in output.evidences:
-        parts.append("")
-        parts.append(f"### 业务依据 {e.id}\n\n{e.body}")
 
-    parts.append(f"\n## 矛盾提示\n{output.contradictions}")
+    if resolved_list:
+        # ── 有 resolved_list：逐条用 chunk_map 原文重建 ──
+        resolved_map = {r.evidence_id: r for r in resolved_list}
+
+        for evidence in output.evidences:
+            parts.append("")
+            resolved = resolved_map.get(evidence.id)
+
+            if resolved and resolved.resolved_chunks:
+                # 用 chunk_map 原文重建具体内容
+                content_lines = []
+                for chunk in resolved.resolved_chunks:
+                    content_lines.append(
+                        f"**[{chunk['chunk_index']}]**\n{chunk['chunk_content']}"
+                    )
+                rebuilt_content = "\n\n".join(content_lines)
+                parts.append(
+                    f"### 业务依据 {evidence.id}\n\n"
+                    f"{resolved.body_metadata}\n"
+                    f"具体内容：\n{rebuilt_content}"
+                )
+            else:
+                # 回退：chunk_map 未命中，使用 Curator body 原始内容
+                parts.append(f"### 业务依据 {evidence.id}\n\n{evidence.body}")
+    else:
+        # ── 无 resolved_list：直接使用 Curator body（向后兼容）──
+        for evidence in output.evidences:
+            parts.append("")
+            parts.append(f"### 业务依据 {evidence.id}\n\n{evidence.body}")
+
+    # ── 矛盾提示 ──
+    parts.append(f"\n## 矛盾提示\n\n{output.contradictions}")
 
     return "\n".join(parts)
 
