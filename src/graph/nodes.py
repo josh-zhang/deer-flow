@@ -1066,3 +1066,433 @@ def validate_plan_structure(plan: Any, workflow_type: str) -> tuple[bool, str]:
             )
 
     return True, ""
+
+
+"""
+Tool return pipeline: data models → tool formatters → hook → post-processing.
+
+Unified data flow:
+  Tool execution → ToolMessage(content=Markdown, artifact=structured) 
+    → Hook captures artifact into cache
+    → Searcher node end: format cache → Curator input + chunk_maps for State
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+from langchain_core.messages import ToolMessage
+from pydantic import BaseModel, Field
+
+# 从截取模块导入
+from src.extraction.chunk_extractor import ExtractionResult
+
+logger = logging.getLogger(__name__)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  1. 统一数据模型
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ToolChunk(BaseModel):
+    """工具返回中的单个文档片段/段落。"""
+    chunk_index: str
+    chunk_content: str
+
+
+class ToolDocumentReturn(BaseModel):
+    """单个文档维度的工具返回数据。三种工具共用此结构。"""
+    document_title: str
+    document_url: str | None = None
+    file_id: str | None = None
+    description: str | None = None       # local_search 的 description 元数据
+
+    chunks: list[ToolChunk] = Field(default_factory=list)
+
+    # ── 截取元数据（仅 crawl/fetch 有值）──
+    is_extracted: bool = False            # True = 执行了截取
+    chunk_map: dict[str, str] | None = None  # 全量 chunk_index → content 映射
+
+
+class ToolCallArtifact(BaseModel):
+    """单次工具调用的结构化 artifact，存入 ToolMessage.artifact。"""
+    tool_type: str                        # "local_search" | "crawl" | "fetch"
+    documents: list[ToolDocumentReturn] = Field(default_factory=list)
+
+
+class ToolCallRecord(BaseModel):
+    """Hook 缓存中的单条记录。"""
+    call_index: int
+    tool_name: str
+    content_md: str                       # Searcher 可见的 Markdown
+    artifact: ToolCallArtifact | None = None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  2. 工具输出格式化器
+#     每个工具调用这些函数来构造 (content, artifact) 元组
+#     配合 @tool(response_format="content_and_artifact") 使用
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ── 2a. local_search_tool ─────────────────────────
+
+def format_local_search_return(
+    raw_results: list[dict],
+) -> tuple[str, dict]:
+    """
+    将 local_search 的原始结果格式化为 (content_md, artifact_dict)。
+
+    raw_results 的期望结构（来自向量数据库）：
+    [
+        {
+            "document_title": "信用卡分期业务管理办法",
+            "document_url": "http://...",
+            "file_id": "000001-000001",
+            "description": "总行指引",
+            "chunk_index": "3",
+            "chunk_content": "白金卡账单分期手续费率...",
+            "score": 0.85,
+        },
+        ...
+    ]
+    """
+    # ── 按文档分组 ──
+    doc_groups: dict[str, dict] = {}
+    for r in raw_results:
+        title = r.get("document_title", "未知文档")
+        if title not in doc_groups:
+            doc_groups[title] = {
+                "document_title": title,
+                "document_url": r.get("document_url"),
+                "file_id": r.get("file_id"),
+                "description": r.get("description"),
+                "chunks": [],
+            }
+        doc_groups[title]["chunks"].append({
+            "chunk_index": str(r.get("chunk_index", "")),
+            "chunk_content": r.get("chunk_content", ""),
+        })
+
+    # ── 构建 content_md（Searcher 可见）──
+    md_parts: list[str] = []
+    artifact_docs: list[ToolDocumentReturn] = []
+
+    for doc_idx, (title, doc_data) in enumerate(doc_groups.items(), 1):
+        # Markdown header
+        url_part = f" | url: {doc_data['document_url']}" if doc_data["document_url"] else ""
+        fid_part = f" | 编号: {doc_data['file_id']}" if doc_data["file_id"] else ""
+        desc_part = f" | {doc_data['description']}" if doc_data["description"] else ""
+        md_parts.append(
+            f"**文档 {doc_idx}** — 《{title}》{desc_part}{url_part}{fid_part}"
+        )
+        md_parts.append("")
+
+        chunks = doc_data["chunks"]
+        tool_chunks: list[ToolChunk] = []
+
+        for chunk in chunks:
+            idx = chunk["chunk_index"]
+            content = chunk["chunk_content"].strip()
+            md_parts.append(f"**[{idx}]**\n{content}")
+            md_parts.append("")
+            tool_chunks.append(ToolChunk(chunk_index=idx, chunk_content=content))
+
+        md_parts.append("---")
+        md_parts.append("")
+
+        artifact_docs.append(ToolDocumentReturn(
+            document_title=title,
+            document_url=doc_data["document_url"],
+            file_id=doc_data["file_id"],
+            description=doc_data["description"],
+            chunks=tool_chunks,
+            is_extracted=False,
+            chunk_map=None,
+        ))
+
+    content_md = "\n".join(md_parts).strip()
+    artifact = ToolCallArtifact(tool_type="local_search", documents=artifact_docs)
+
+    return content_md, artifact.model_dump()
+
+
+# ── 2b. crawl_tool / fetch_tool ──────────────────
+
+def format_crawl_fetch_return(
+    extraction_result: ExtractionResult,
+    tool_type: str = "crawl",
+    document_url: str | None = None,
+    file_id: str | None = None,
+    description: str | None = None,
+) -> tuple[str, dict]:
+    """
+    将 ExtractionResult 格式化为 (content_md, artifact_dict)。
+
+    Args:
+        extraction_result: 截取模块的输出。
+        tool_type: "crawl" 或 "fetch"。
+        document_url: 文档 URL。
+        file_id: 知识库文档编号。
+        description: 文档分类描述。
+    """
+    # ── content_md: Searcher 可见 ──
+    if extraction_result.is_extracted:
+        content_md = extraction_result.extracted_text_md
+    else:
+        content_md = extraction_result.full_text_md
+
+    # ── artifact: 结构化数据 ──
+    tool_chunks = [
+        ToolChunk(chunk_index=ec.chunk_index, chunk_content=ec.chunk_content)
+        for ec in extraction_result.extracted_chunks
+    ]
+
+    doc = ToolDocumentReturn(
+        document_title=extraction_result.document_title,
+        document_url=document_url,
+        file_id=file_id,
+        description=description,
+        chunks=tool_chunks,
+        is_extracted=extraction_result.is_extracted,
+        chunk_map=extraction_result.chunk_map if extraction_result.chunk_map else None,
+    )
+
+    artifact = ToolCallArtifact(tool_type=tool_type, documents=[doc])
+
+    return content_md, artifact.model_dump()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  3. Hook：拦截 ToolMessage，解析 artifact 存入缓存
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def make_tool_saver_hook(cache: list[ToolCallRecord]):
+    """
+    PreModelHook：每次模型调用前扫描 messages，
+    将新出现的 ToolMessage 的 artifact 存入旁路缓存。
+
+    执行顺序：先于 ContextManager（确保消息被压缩前已缓存）。
+    """
+    seen_ids: set[str] = set()
+
+    def hook(messages: list) -> list:
+        for msg in messages:
+            if not isinstance(msg, ToolMessage):
+                continue
+
+            msg_id = msg.id or str(id(msg))
+            if msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
+
+            # 解析 artifact
+            raw_artifact = getattr(msg, "artifact", None)
+            parsed_artifact = None
+
+            if raw_artifact is not None:
+                try:
+                    if isinstance(raw_artifact, dict):
+                        parsed_artifact = ToolCallArtifact.model_validate(raw_artifact)
+                    elif isinstance(raw_artifact, ToolCallArtifact):
+                        parsed_artifact = raw_artifact
+                except Exception as e:
+                    logger.warning("Failed to parse tool artifact: %s", e)
+
+            content_md = (
+                msg.content if isinstance(msg.content, str)
+                else json.dumps(msg.content, ensure_ascii=False)
+            )
+
+            cache.append(ToolCallRecord(
+                call_index=len(cache) + 1,
+                tool_name=getattr(msg, "name", None) or "unknown",
+                content_md=content_md,
+                artifact=parsed_artifact,
+            ))
+
+        return messages  # 原样返回，不改动消息
+
+    return hook
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  4. Searcher 节点尾部处理
+#     将缓存转化为 Curator 输入 + 提取 chunk_maps
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TOOL_NAME_DISPLAY = {
+    "local_search_tool": "语义检索",
+    "crawl_tool": "全文获取(url)",
+    "fetch_tool": "全文获取(文档名)",
+}
+
+
+def format_tool_cache_for_curator(
+    cache: list[ToolCallRecord],
+    step_title: str = "",
+) -> str:
+    """
+    将缓存的全部工具调用格式化为 Curator 的"原始工具返回"输入。
+
+    输出格式（Markdown）：
+    === 第1次调用（local_search_tool / 语义检索）===
+    [content_md from tool]
+
+    === 第2次调用（crawl_tool / 全文获取）===
+    [content_md from tool]
+    """
+    if not cache:
+        return "（本步骤未执行任何工具调用）"
+
+    parts: list[str] = []
+    if step_title:
+        parts.append(f"## {step_title} 的原始工具返回\n")
+
+    for record in cache:
+        display_name = TOOL_NAME_DISPLAY.get(record.tool_name, record.tool_name)
+        parts.append(
+            f"=== 第{record.call_index}次调用（{record.tool_name} / {display_name}）==="
+        )
+        parts.append("")
+        parts.append(record.content_md)
+        parts.append("")
+
+    return "\n".join(parts).strip()
+
+
+def extract_chunk_maps_from_cache(
+    cache: list[ToolCallRecord],
+) -> dict[str, dict[str, str]]:
+    """
+    从缓存中提取所有文档的 chunk_map。
+
+    返回: {document_title: {chunk_index: chunk_content}}
+
+    合并策略：
+    - crawl/fetch 的 chunk_map (全量) 优先
+    - local_search 的 chunks 作为补充
+    - 同一文档多次出现时取并集
+    """
+    result: dict[str, dict[str, str]] = defaultdict(dict)
+
+    # Pass 1: 收集 crawl/fetch 的完整 chunk_map（优先级高）
+    for record in cache:
+        if record.artifact is None:
+            continue
+        for doc in record.artifact.documents:
+            if doc.chunk_map:
+                # 完整 chunk_map 直接写入（覆盖 local_search 的部分数据）
+                result[doc.document_title].update(doc.chunk_map)
+
+    # Pass 2: 补充 local_search 的 chunks（不覆盖已有的）
+    for record in cache:
+        if record.artifact is None:
+            continue
+        for doc in record.artifact.documents:
+            if doc.chunk_map:
+                continue  # 已在 Pass 1 处理
+            for chunk in doc.chunks:
+                if chunk.chunk_index not in result[doc.document_title]:
+                    result[doc.document_title][chunk.chunk_index] = chunk.chunk_content
+
+    return dict(result)
+
+
+def extract_document_metadata_from_cache(
+    cache: list[ToolCallRecord],
+) -> dict[str, dict]:
+    """
+    从缓存中提取所有文档的元数据（去重）。
+
+    返回: {document_title: {"url": ..., "file_id": ..., "is_extracted": ...}}
+    """
+    metadata: dict[str, dict] = {}
+
+    for record in cache:
+        if record.artifact is None:
+            continue
+        for doc in record.artifact.documents:
+            title = doc.document_title
+            if title not in metadata:
+                metadata[title] = {
+                    "document_url": doc.document_url,
+                    "file_id": doc.file_id,
+                    "description": doc.description,
+                    "is_extracted": doc.is_extracted,
+                    "source_tools": [],
+                }
+            metadata[title]["source_tools"].append(record.tool_name)
+            # crawl/fetch 的 is_extracted 优先（它比 local_search 更明确）
+            if doc.is_extracted:
+                metadata[title]["is_extracted"] = True
+
+    return metadata
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  5. Searcher Node 集成示例
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def searcher_node(state: dict) -> dict:
+    """
+    Searcher 节点：执行 ReAct agent，缓存工具返回，格式化输出。
+
+    返回更新 State 的字段：
+    - searcher_results:         Curator 的原始工具返回 Markdown（追加当前步骤）
+    - searcher_summaries:       Searcher 检索摘要文本（追加当前步骤）
+    - document_chunk_maps:      全局文档 chunk_map 累积（合并更新）
+    - document_metadata:        全局文档元数据累积（合并更新）
+    """
+    tool_returns_cache: list[ToolCallRecord] = []
+
+    middleware = [
+        # ① 先执行：缓存 ToolMessage artifact
+        PreModelHookMiddleware(make_tool_saver_hook(tool_returns_cache)),
+        # ② 后执行：消息压缩（可能删除旧 ToolMessage）
+        PreModelHookMiddleware(partial(
+            ContextManager(llm_token_limit, 3).compress_messages
+        )),
+    ]
+
+    agent = create_agent(
+        name="searcher",
+        model=llm_model,
+        tools=tools,
+        middleware=middleware,
+    )
+
+    result = await agent.astream(state["messages"])
+
+    # ── 从缓存生成 Curator 输入 ──
+    step_title = state.get("current_step_title", "")
+    curator_tool_input = format_tool_cache_for_curator(tool_returns_cache, step_title)
+
+    # ── 提取 chunk_maps 和文档元数据 ──
+    new_chunk_maps = extract_chunk_maps_from_cache(tool_returns_cache)
+    new_doc_metadata = extract_document_metadata_from_cache(tool_returns_cache)
+
+    # ── 合并到全局 chunk_maps（State 中已有的 + 本步骤新增的）──
+    existing_maps = state.get("document_chunk_maps", {})
+    for doc_title, cmap in new_chunk_maps.items():
+        if doc_title in existing_maps:
+            existing_maps[doc_title].update(cmap)
+        else:
+            existing_maps[doc_title] = cmap
+
+    existing_metadata = state.get("document_metadata", {})
+    existing_metadata.update(new_doc_metadata)
+
+    return {
+        "messages": result["messages"],
+        # Curator 输入：Markdown 格式的工具返回
+        "searcher_results": [curator_tool_input],
+        # Searcher 检索摘要（从 agent 最终文本输出提取）
+        "searcher_summaries": [extract_final_text(result)],
+        # 全局 chunk_map 累积
+        "document_chunk_maps": existing_maps,
+        # 全局文档元数据累积
+        "document_metadata": existing_metadata,
+    }

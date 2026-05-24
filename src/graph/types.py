@@ -112,3 +112,18 @@ class State(MessagesState):
     # ═══════════════════════════════════════════════════
     auto_accepted_plan: bool = False
     goto: str = "planner"
+
+    # ═══════════════════════════════════════════════════
+    #  Document Chunk Maps — 全局累积，跨步骤合并
+    #  用途：Curator 引用段落编号后，框架通过此映射提取原文
+    #        传给 Rule Splitter / Analyst
+    # ═══════════════════════════════════════════════════
+    document_chunk_maps: dict[str, dict[str, str]] = field(default_factory=dict)
+    # {document_title: {chunk_index: chunk_content}}
+
+    # ═══════════════════════════════════════════════════
+    #  Document Metadata — 全局累积
+    #  用途：跟踪每个文档的 URL、编号、是否经过截取等
+    # ═══════════════════════════════════════════════════
+    document_metadata: dict[str, dict] = field(default_factory=dict)
+    # {document_title: {"document_url", "file_id", "description", "is_extracted", "source_tools"}}
