@@ -174,6 +174,73 @@ def build_evaluator_input(step, searcher_annotation, raw_tool_returns) -> str:
     return "\n".join(input_parts)
 
 
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  3. Reporter 输入格式化
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def format_citations_for_reporter(
+    citations: list[dict[str, Any]],
+) -> str:
+    """
+    将 citations 格式化为 Reporter 提示词中的"可用参考来源"段落。
+
+    输出示例:
+        # 可用参考来源
+
+        正文中需要引用时，在句末使用 `[[n]](#ref-n)`，n 为下方序号。
+        仅限引用下方列出的来源，严禁编造 URL。
+
+        [1] 信用卡分期业务管理办法 - http://xxx
+        [2] 白金卡产品说明书 - http://yyy
+    """
+    ordered = _dedupe_citations_preserve_order(citations)
+
+    if not ordered:
+        return (
+            "# 可用参考来源\n\n"
+            "当前无可用参考来源。报告中请勿使用 `[[n]](#ref-n)` 引用标记。\n"
+            "如需引用文档，仅用《文档名》指代。"
+        )
+
+    lines = [
+        "# 可用参考来源",
+        "",
+        "正文中需要引用时，在句末使用 `[[n]](#ref-n)`，n 为下方序号。",
+        "仅限引用下方列出的来源，严禁编造未列出的来源或 URL。",
+        "",
+    ]
+
+    for i, c in enumerate(ordered, 1):
+        title = (c.get("title") or "未知文档").strip()
+        url = (c.get("url") or "").strip()
+
+        if url:
+            lines.append(f"[{i}] {title} - {url}")
+        else:
+            lines.append(f"[{i}] {title}")
+
+    return "\n".join(lines)
+
+
+def _dedupe_citations_preserve_order(
+    citations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """去重并保持插入顺序。"""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for c in citations or []:
+        if not isinstance(c, dict):
+            continue
+        key = _citation_dedup_key(c.get("title", ""), c.get("url"))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+
 def build_point_analyst_input(material_text, step, review_point, evaluator_output) -> str:
     """组装 CP Point Analyst 的输入文本"""
 

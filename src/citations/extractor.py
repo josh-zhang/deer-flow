@@ -12,8 +12,6 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from .models import CitationMetadata
-
 logger = logging.getLogger(__name__)
 
 
@@ -33,7 +31,7 @@ def extract_citations_from_messages(messages: List[Any]) -> List[Dict[str, Any]]
     logger.info(f"[Citations] Starting extraction from {len(messages)} messages")
 
     for message in messages:
-        # Extract from ToolMessage results (web_search, crawl)
+        # Extract from ToolMessage results (local search, crawl)
         if isinstance(message, ToolMessage):
             logger.info(
                 f"[Citations] Found ToolMessage: name={getattr(message, 'name', 'unknown')}"
@@ -48,11 +46,11 @@ def extract_citations_from_messages(messages: List[Any]) -> List[Dict[str, Any]]
         # Also check AIMessage tool_calls for any embedded results
         if isinstance(message, AIMessage) and hasattr(message, "tool_calls"):
             for tool_call in message.tool_calls or []:
-                if tool_call.get("name") == "web_search":
+                if tool_call.get("name") == "local_search_tool":
                     # The query is in the args
                     query = tool_call.get("args", {}).get("query", "")
                     logger.info(
-                        "[Citations] Found web_search tool call with query=%r", query
+                        "[Citations] Found local search tool call with query=%r", query
                     )
                     # Note: results come in subsequent ToolMessage
 
@@ -100,13 +98,9 @@ def _extract_from_tool_message(message: ToolMessage) -> List[Dict[str, Any]]:
     # Try to detect content type by structure rather than just tool name
     tool_name_lower = tool_name.lower() if tool_name else ""
 
-    # Handle web_search results (by name or by structure)
+    # Handle local_search results (by name or by structure)
     if tool_name_lower in (
-        "web_search",
-        "tavily_search",
-        "duckduckgo_search",
-        "brave_search",
-        "searx_search",
+        "local_search",
     ):
         citations.extend(_extract_from_search_results(data))
         logger.debug(
@@ -114,7 +108,7 @@ def _extract_from_tool_message(message: ToolMessage) -> List[Dict[str, Any]]:
         )
 
     # Handle crawl results (by name or by structure)
-    elif tool_name_lower in ("crawl_tool", "crawl", "jina_crawl"):
+    elif tool_name_lower in ("crawl_tool", "crawl"):
         citation = _extract_from_crawl_result(data)
         if citation:
             citations.append(citation)
@@ -146,7 +140,7 @@ def _extract_from_tool_message(message: ToolMessage) -> List[Dict[str, Any]]:
 
 def _extract_from_search_results(data: Any) -> List[Dict[str, Any]]:
     """
-    Extract citations from web search results.
+    Extract citations from local search results.
 
     Args:
         data: Parsed JSON data from search tool
@@ -202,7 +196,7 @@ def _result_to_citation(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "relevance_score": result.get("score", 0.0),
         "domain": _extract_domain(url),
         "accessed_at": None,  # Will be filled by CitationMetadata
-        "source_type": "web_search",
+        "source_type": "local_search",
     }
 
 

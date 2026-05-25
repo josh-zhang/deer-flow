@@ -2,6 +2,7 @@
 import copy
 import json
 import logging
+import re
 from typing import List
 
 from langgraph.runtime import Runtime 
@@ -17,6 +18,22 @@ from langchain_core.messages import (
 from src.config import load_yaml_config
 
 logger = logging.getLogger(__name__)
+
+
+
+# 匹配 chunk header: **[任意编号]** 可能跟 `[上下文]` / `[兜底]`
+_CHUNK_HEADER_RE = re.compile(r"^\*\*\[.+?\]\*\*")
+
+# 识别 Markdown 结构行（不截断）
+_STRUCTURAL_PREFIXES = (
+    "**文档", "**[",             # 文档标题 / 段落编号
+    "===", "---",                # 分隔符
+    "【截取结果】",               # 截取水印
+    "#",                         # Markdown 标题
+)
+
+# 需要压缩的工具名
+_COMPRESSIBLE_TOOLS = {"local_search_tool", "crawl_tool", "fetch_tool"}
 
 
 def get_search_config():
@@ -188,86 +205,123 @@ class ContextManager:
 
     def _compress_messages(self, messages: List[BaseMessage]) -> List[BaseMessage]:
         """
-        Compress messages to fit within token limit through two strategies:
-        1. First, compress web_search ToolMessage raw_content by truncating to 1024 chars
-        2. If still over limit, drop oldest messages while preserving prefix messages and system messages
-        
-        Args:
-            messages: List of messages to compress
-        Returns:
-            List of messages with compressed content and/or dropped messages
+        三阶段压缩：
+        1. 截断工具返回的 Markdown 内容（按段落粒度）
+        2. 若仍超限，丢弃最旧的非保护消息
+        3. 验证并告警
+
+        注意：不修改 ToolMessage.artifact（hook 已缓存，且 artifact 不计入 token）。
         """
-        # Create a deep copy to avoid mutating original messages
         compressed = copy.deepcopy(messages)
-        
-        # Step 1: Compress raw_content in web_search ToolMessages
+
+        # ══════════════════════════════════════════════════
+        #  Step 1: 按段落粒度截断工具内容
+        # ══════════════════════════════════════════════════
         for msg in compressed:
-            # Only compress ToolMessage with name 'web_search'
-            if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "web_search":
-                try:
-                    # Determine content type and check if compression is needed
-                    if isinstance(msg.content, str):
-                        # Early exit if content is small enough (avoid JSON parsing overhead)
-                        # A heuristic: if string is less than 2KB, raw_content likely doesn't need truncation
-                        if len(msg.content) < 2048:
-                            continue
-                        
-                        try:
-                            content_data = json.loads(msg.content)
-                        except json.JSONDecodeError as e:
-                            logger.error(f"Failed to parse JSON content in web_search ToolMessage: {e}. Content: {msg.content[:200]}")
-                            continue
-                    elif isinstance(msg.content, list):
-                        content_data = copy.deepcopy(msg.content)
-                    else:
-                        continue
+            if not isinstance(msg, ToolMessage):
+                continue
+            tool_name = getattr(msg, "name", None) or ""
+            if tool_name not in _COMPRESSIBLE_TOOLS:
+                continue
+            if not isinstance(msg.content, str):
+                continue
+            if len(msg.content) < 2048:
+                continue
 
-                    # Compress raw_content in the content (item by item processing)
-                    # Track if any modifications were made
-                    modified = False
-                    if isinstance(content_data, list):
-                        for item in content_data:
-                            if isinstance(item, dict) and "raw_content" in item:
-                                raw_content = item.get("raw_content")
-                                if raw_content and isinstance(raw_content, str) and len(raw_content) > 1024:
-                                    item["raw_content"] = raw_content[:1024]
-                                    modified = True
-                        
-                        # Update message content with modified data only if changes were made
-                        if modified:
-                            msg.content = json.dumps(content_data, ensure_ascii=False)
-                except Exception as e:
-                    logger.error(f"Unexpected error during message compression: {e}")
-                    continue
+            compressed_content, was_modified = self._compress_markdown_content(
+                msg.content,
+                chunk_body_limit=300 if tool_name == "local_search_tool" else 512,
+            )
+            if was_modified:
+                msg.content = compressed_content
 
-        # Step 2: If still over limit after raw_content compression, drop oldest messages
-        # while preserving prefix messages (e.g., system message) and recent messages
+        # ══════════════════════════════════════════════════
+        #  Step 2: 丢弃最旧消息
+        # ══════════════════════════════════════════════════
         if self.is_over_limit(compressed):
-            # Identify messages to preserve at the beginning
             preserved_count = self.preserve_prefix_message_count
-            preserved_messages = compressed[:preserved_count]
-            remaining_messages = compressed[preserved_count:]
-            
-            # Drop messages from the middle, keeping the most recent ones
-            result_messages = preserved_messages
-            for msg in reversed(remaining_messages):
-                result_messages.insert(len(preserved_messages), msg)
-                if not self.is_over_limit(result_messages):
-                    break
-            
-            compressed = result_messages
+            preserved = compressed[:preserved_count]
+            remaining = compressed[preserved_count:]
 
-        # Step 3: Verify that compression was successful and log warning if needed
+            # 从最新往最旧加，直到不超限
+            result = list(preserved)
+            for msg in reversed(remaining):
+                result.insert(preserved_count, msg)
+                if not self.is_over_limit(result):
+                    break
+
+            compressed = result
+
+        # ══════════════════════════════════════════════════
+        #  Step 3: 验证
+        # ══════════════════════════════════════════════════
         if self.is_over_limit(compressed):
             current_tokens = self.count_tokens(compressed)
             logger.warning(
-                f"Message compression failed to bring tokens below limit: "
-                f"{current_tokens} > {self.token_limit} tokens. "
-                f"Total messages: {len(compressed)}. "
-                f"Consider increasing token_limit or preserve_prefix_message_count."
+                "消息压缩后仍超限: %d > %d tokens, 共 %d 条消息",
+                current_tokens, self.token_limit, len(compressed),
             )
 
         return compressed
+
+    def _compress_markdown_content(
+            self,
+            content: str,
+            chunk_body_limit: int = 300,
+    ) -> tuple[str, bool]:
+        """
+        按段落粒度截断 Markdown 格式的工具返回内容。
+
+        保留所有结构行（文档标题、段落编号、分隔符、水印），
+        仅截断段落正文。
+
+        Args:
+            content:          原始 Markdown 内容
+            chunk_body_limit: 每个段落正文的最大字符数
+
+        Returns:
+            (compressed_content, was_modified)
+        """
+        lines = content.split("\n")
+        output: list[str] = []
+        chunk_body_acc = 0
+        chunk_truncated = False
+        modified = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            # ── 段落编号行：重置累计器 ──
+            if _CHUNK_HEADER_RE.match(stripped):
+                chunk_body_acc = 0
+                chunk_truncated = False
+                output.append(line)
+                continue
+
+            # ── 结构行 / 空行：直接保留 ──
+            if stripped == "" or any(stripped.startswith(p) for p in _STRUCTURAL_PREFIXES):
+                output.append(line)
+                continue
+
+            # ── 段落正文行 ──
+            if chunk_truncated:
+                # 当前段落已截断，跳过后续行
+                continue
+
+            new_acc = chunk_body_acc + len(line) + 1
+            if new_acc > chunk_body_limit:
+                remaining = max(0, chunk_body_limit - chunk_body_acc)
+                if remaining > 50:
+                    output.append(line[:remaining] + "…")
+                output.append("[…段落内容已截断，完整数据已缓存]")
+                chunk_truncated = True
+                modified = True
+            else:
+                output.append(line)
+                chunk_body_acc = new_acc
+
+        return "\n".join(output), modified
+
 
     def _create_summary_message(self, messages: List[BaseMessage]) -> BaseMessage:
         """

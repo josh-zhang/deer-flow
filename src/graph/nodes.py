@@ -301,12 +301,9 @@ def _format_citation_list_for_reporter(citations: list[dict[str, Any]]) -> str:
         title = str(c.get("title") or "Untitled").strip() or "Untitled"
         url = str(c.get("url") or "").strip()
         extra = c.get("extra") if isinstance(c.get("extra"), dict) else {}
-        file_id = str(c.get("file_id") or extra.get("file_id") or "").strip()
         lines.append(f"{i}. **{title}**")
         if url:
             lines.append(f"   - URL: `{url}`")
-        if file_id:
-            lines.append(f"   - 文档编号: `{file_id}`")
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -982,14 +979,17 @@ async def reporter_node(state: State, config: RunnableConfig) -> dict:
     thought = getattr(plan, "thought", "") if plan else ""
     observations = list(state.get("observations", []))
     obs_text = "\n\n---\n\n".join(observations)
-    citations = [c for c in (state.get("citations") or []) if isinstance(c, dict)]
-    cit = _format_citation_list_for_reporter(citations)
+    # citations = [c for c in (state.get("citations") or []) if isinstance(c, dict)]
+    # cit = _format_citation_list_for_reporter(citations)
+
+    citations_section = format_citations_for_reporter(state.get("citations", []))
+
     q = state.get("clarified_research_topic") or state.get("research_topic", "")
     human = (
         f"## 1. 调查原始问题\n{q}\n\n"
         f"## 2. 调查计划制定思路\n{thought or '（无）'}\n\n"
         f"## 3. Analyst 的 observations\n{obs_text or '（无）'}\n\n"
-        f"## 4. 可用参考来源\n{cit}\n"
+        f"## 4. 可用参考来源\n{citations_section}\n"
     )
     sub = {**state, "workflow_type": wf, "messages": [HumanMessage(content=human)]}
     msgs = apply_prompt_template("reporter", sub, configurable)
@@ -1466,15 +1466,12 @@ async def searcher_node(state: dict) -> dict:
 
     result = await agent.astream(state["messages"])
 
-    # ── 从缓存生成 Curator 输入 ──
+    # Curator 输入
     step_title = state.get("current_step_title", "")
     curator_tool_input = format_tool_cache_for_curator(tool_returns_cache, step_title)
 
-    # ── 提取 chunk_maps 和文档元数据 ──
+    # Chunk maps（全局累积）
     new_chunk_maps = extract_chunk_maps_from_cache(tool_returns_cache)
-    new_doc_metadata = extract_document_metadata_from_cache(tool_returns_cache)
-
-    # ── 合并到全局 chunk_maps（State 中已有的 + 本步骤新增的）──
     existing_maps = state.get("document_chunk_maps", {})
     for doc_title, cmap in new_chunk_maps.items():
         if doc_title in existing_maps:
@@ -1482,8 +1479,15 @@ async def searcher_node(state: dict) -> dict:
         else:
             existing_maps[doc_title] = cmap
 
+    # Document metadata（全局累积）
+    new_metadata = extract_document_metadata_from_cache(tool_returns_cache)
     existing_metadata = state.get("document_metadata", {})
-    existing_metadata.update(new_doc_metadata)
+    existing_metadata.update(new_metadata)
+
+    # Citations（跨步骤 merge）
+    new_citations = extract_citations_from_cache(tool_returns_cache)
+    existing_citations = state.get("citations", [])
+    merged_citations = merge_citations(existing_citations, new_citations)
 
     return {
         "messages": result["messages"],
@@ -1495,4 +1499,5 @@ async def searcher_node(state: dict) -> dict:
         "document_chunk_maps": existing_maps,
         # 全局文档元数据累积
         "document_metadata": existing_metadata,
+        "citations": merged_citations,
     }

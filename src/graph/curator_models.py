@@ -187,51 +187,89 @@ class ResolvedEvidence:
     is_tool_extracted: bool
 
 
-from dataclasses import dataclass
+_STRIP_CHARS_PATTERN = re.compile(r"[《》〈〉<>【】\[\]「」『』\s]")
 
+
+def normalize_doc_title(title: str) -> str:
+    """去除书名号、括号、空白等装饰字符，返回纯净文档名。"""
+    return _STRIP_CHARS_PATTERN.sub("", title).strip()
+
+
+def fuzzy_match_chunk_map(
+    curator_doc_title: str,
+    document_chunk_maps: dict[str, dict[str, str]],
+) -> dict[str, str] | None:
+    """
+    三级匹配策略查找 chunk_map：
+    1. 精确匹配
+    2. 归一化后精确匹配
+    3. 归一化后包含匹配（一方包含另一方）
+
+    返回 chunk_map 或 None。
+    """
+    # Level 1: 精确匹配
+    if curator_doc_title in document_chunk_maps:
+        return document_chunk_maps[curator_doc_title]
+
+    # Level 2: 归一化匹配
+    norm_query = normalize_doc_title(curator_doc_title)
+    if not norm_query:
+        return None
+
+    for key, chunk_map in document_chunk_maps.items():
+        if normalize_doc_title(key) == norm_query:
+            return chunk_map
+
+    # Level 3: 包含匹配
+    for key, chunk_map in document_chunk_maps.items():
+        norm_key = normalize_doc_title(key)
+        if not norm_key:
+            continue
+        if norm_query in norm_key or norm_key in norm_query:
+            logger.info(
+                "文档名包含匹配：Curator '%s' ↔ chunk_map '%s'",
+                curator_doc_title, key,
+            )
+            return chunk_map
+
+    return None
+
+
+# ── 在 resolve_all_evidence_chunks 中替换原有的 dict.get ──
 
 def resolve_all_evidence_chunks(
-    curator_output: CuratorOutput,
+    curator_output: "CuratorOutput",
     document_chunk_maps: dict[str, dict[str, str]],
-) -> list[ResolvedEvidence]:
-    """
-    遍历 Curator 输出的每条 evidence，
-    利用 State.document_chunk_maps 将引用段落解析为原文。
-
-    Args:
-        curator_output:       parse_curator_output() 的返回值
-        document_chunk_maps:  State 中的全局文档段落映射
-                              {document_title: {chunk_index: chunk_content}}
-
-    Returns:
-        每条 evidence 对应一个 ResolvedEvidence，
-        其中 resolved_chunks 为从 chunk_map 解析出的原文段落列表。
-    """
-    results: list[ResolvedEvidence] = []
+) -> list["ResolvedEvidence"]:
+    results = []
 
     for evidence in curator_output.evidences:
         metadata, content = _find_content_boundary(evidence.body)
-
-        # 查找该文档的 chunk_map
         doc_title = evidence.source_document
-        chunk_map = document_chunk_maps.get(doc_title, {})
+
+        # ── 模糊匹配替代精确查询 ──
+        chunk_map = fuzzy_match_chunk_map(doc_title, document_chunk_maps)
+
+        if chunk_map is None:
+            logger.warning(
+                "Evidence %s 的文档 '%s' 在 chunk_maps 中未找到（含模糊匹配）。"
+                "回退至 body 中的具体内容。chunk_maps 现有 keys: %s",
+                evidence.id, doc_title, list(document_chunk_maps.keys()),
+            )
+            chunk_map = {}
 
         resolved = []
         missing = []
         for idx in evidence.referenced_chunks:
             if idx in chunk_map:
-                resolved.append({
-                    "chunk_index": idx,
-                    "chunk_content": chunk_map[idx],
-                })
+                resolved.append({"chunk_index": idx, "chunk_content": chunk_map[idx]})
             else:
                 missing.append(idx)
 
-        if missing:
+        if missing and chunk_map:
             logger.warning(
-                "Evidence %s 引用段落 %s 在文档 '%s' 的 chunk_map 中未找到 "
-                "(chunk_map 含 %d 个段落)。回退至 body 中的具体内容。",
-                evidence.id, missing, doc_title, len(chunk_map),
+                "Evidence %s 引用段落 %s 在文档 '%s' 的 chunk_map 中未找到。",
+                evidence.id, missing, doc_title,
             )
 
         results.append(ResolvedEvidence(
@@ -265,7 +303,7 @@ def _find_content_boundary(body: str) -> tuple[str, str]:
     return body.strip(), ""
 
 
-def _build_rule_splitter_view_with_resolved(
+def build_rule_splitter_view_with_resolved(
     output: CuratorOutput,
     resolved_list: list[ResolvedEvidence],
 ) -> str:

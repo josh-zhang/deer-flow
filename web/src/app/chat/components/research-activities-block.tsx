@@ -4,7 +4,7 @@
 import { PythonOutlined } from "@ant-design/icons";
 import { motion } from "framer-motion";
 import { LRUCache } from "lru-cache";
-import { BookOpenText, FileText, PencilRuler, Search } from "lucide-react";
+import { BookOpenText, FileText, PencilRuler, Search, Scissors, Download } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { useTheme } from "next-themes";
 import React, { useMemo } from "react";
@@ -30,6 +30,40 @@ import type { ToolCallRuntime } from "~/core/messages";
 import { useMessage, useStore } from "~/core/store";
 import { parseJSON } from "~/core/utils";
 import { cn } from "~/lib/utils";
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Types（与后端 ToolCallArtifact 对齐）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+interface ToolChunk {
+  chunk_index: string;
+  chunk_content: string;
+}
+
+interface ToolDocumentReturn {
+  document_title: string;
+  document_url: string | null;
+  file_id: string | null;
+  description: string | null;
+  chunks: ToolChunk[];
+  is_extracted: boolean;
+}
+
+interface ToolCallArtifact {
+  tool_type: string;
+  documents: ToolDocumentReturn[];
+}
+
+/** 前端展示用的文档摘要 */
+interface DocumentSummary {
+  title: string;
+  url: string | null;
+  fileId: string | null;
+  chunkCount: number;
+  isExtracted: boolean;
+}
+
 
 // Performance optimization constants
 const MAX_ANIMATED_ITEMS = 10; // Only animate first 10 items
@@ -278,106 +312,347 @@ function WebSearchToolCall({ toolCall }: { toolCall: ToolCallRuntime }) {
   );
 }
 
-function CrawlToolCall({ toolCall }: { toolCall: ToolCallRuntime }) {
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Artifact 解析（兼容有/无 artifact 两种场景）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function getArtifact(toolCall: ToolCallRuntime): ToolCallArtifact | null {
+  const raw = (toolCall as any).artifact;
+  if (raw && typeof raw === "object" && Array.isArray(raw.documents)) {
+    return raw as ToolCallArtifact;
+  }
+  return null;
+}
+
+function extractDocsFromArtifact(
+  artifact: ToolCallArtifact,
+): DocumentSummary[] {
+  return artifact.documents.map((doc) => ({
+    title: doc.document_title,
+    url: doc.document_url,
+    fileId: doc.file_id,
+    chunkCount: doc.chunks.length,
+    isExtracted: doc.is_extracted,
+  }));
+}
+
+function extractDocsFromMarkdown(content: string): DocumentSummary[] {
+  const docs: DocumentSummary[] = [];
+  const docHeaderRe =
+    /\*\*文档\s*\d+\*\*\s*—\s*《(.+?)》(?:\s*\|\s*(?:url:\s*(\S+))?)?(?:\s*\|\s*编号:\s*(\S+))?/g;
+  const chunkRe = /\*\*\[.+?\]\*\*/g;
+
+  const sections = content.split(/^---$/m);
+
+  let match: RegExpExecArray | null;
+  for (const section of sections) {
+    docHeaderRe.lastIndex = 0;
+    match = docHeaderRe.exec(section);
+
+    if (match) {
+      const chunks = section.match(chunkRe);
+      docs.push({
+        title: match[1] ?? "未知文档",
+        url: match[2] ?? null,
+        fileId: match[3] ?? null,
+        chunkCount: chunks?.length ?? 0,
+        isExtracted: section.includes("【截取结果】"),
+      });
+    }
+  }
+
+  if (docs.length === 0) {
+    const titleMatch = content.match(/^#\s+(.+?)(?:（截取.*?）)?$/m);
+    if (titleMatch) {
+      const chunks = content.match(chunkRe);
+      docs.push({
+        title: titleMatch[1]?.trim() ?? "未知文档",
+        url: null,
+        fileId: null,
+        chunkCount: chunks?.length ?? 0,
+        isExtracted: content.includes("【截取结果】"),
+      });
+    }
+  }
+
+  return docs;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  共享组件：文档卡片
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function DocumentCard({
+  doc,
+  index,
+  animate = true,
+}: {
+  doc: DocumentSummary;
+  index: number;
+  animate?: boolean;
+}) {
+  const shouldAnimate = animate && index < 6;
+
+  return (
+    <motion.li
+      className="bg-accent text-muted-foreground flex w-44 flex-col gap-1 rounded-md px-3 py-2 text-sm"
+      initial={shouldAnimate ? { opacity: 0, y: 10 } : { opacity: 1, y: 0 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={
+        shouldAnimate
+          ? { duration: 0.15, delay: Math.min(index * 0.05, 0.3), ease: "easeOut" }
+          : undefined
+      }
+    >
+      {/* 标题行 */}
+      <div className="flex items-start gap-1.5">
+        <FileText size={14} className="mt-0.5 shrink-0" />
+        {doc.url ? (
+          <a
+            className="line-clamp-3 flex-grow text-xs leading-snug hover:underline"
+            href={doc.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={doc.title}
+          >
+            {doc.title}
+          </a>
+        ) : (
+          <span
+            className="line-clamp-3 flex-grow text-xs leading-snug"
+            title={doc.title}
+          >
+            {doc.title}
+          </span>
+        )}
+      </div>
+
+      {/* 元信息行 */}
+      <div className="text-muted-foreground/60 mt-auto flex items-center gap-2 text-[11px]">
+        <span>{doc.chunkCount} 个段落</span>
+        {doc.isExtracted && (
+          <span
+            className="bg-amber-500/10 text-amber-600 inline-flex items-center gap-0.5 rounded px-1"
+            title="内容为原文段落子集（截取）"
+          >
+            <Scissors size={10} />
+            截取
+          </span>
+        )}
+      </div>
+    </motion.li>
+  );
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  RetrieverToolCall（local_search_tool）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function RetrieverToolCall({ toolCall }: { toolCall: ToolCallRuntime }) {
   const t = useTranslations("chat.research");
-  const url = useMemo(
-    () => (toolCall.args as { url: string }).url,
+
+  const searching = toolCall.result === undefined;
+
+  const query = useMemo(
+    () => (toolCall.args as { query?: string; keywords?: string }).query
+      ?? (toolCall.args as { keywords?: string }).keywords
+      ?? "",
     [toolCall.args],
   );
-  const title = useMemo(() => __pageCache.get(url), [url]);
+
+  const documents = useMemo<DocumentSummary[]>(() => {
+    if (!toolCall.result) return [];
+
+    // 优先从 artifact 解析
+    const artifact = getArtifact(toolCall);
+    if (artifact) return extractDocsFromArtifact(artifact);
+
+    // 回退：从 Markdown 解析
+    if (typeof toolCall.result === "string") {
+      return extractDocsFromMarkdown(toolCall.result);
+    }
+
+    // 兜底：兼容旧版 JSON 格式
+    try {
+      const parsed = parseJSON(toolCall.result, []);
+      if (Array.isArray(parsed)) {
+        return parsed.map((d: any, i: number) => ({
+          title: d.title || `文档 ${i + 1}`,
+          url: d.url || null,
+          fileId: d.id || null,
+          chunkCount: 1,
+          isExtracted: false,
+        }));
+      }
+    } catch { /* ignore */ }
+
+    return [];
+  }, [toolCall.result]);
+
+  return (
+    <section className="mt-4 pl-4">
+      <div className="font-medium italic">
+        <RainbowText className="flex items-center" animated={searching}>
+          <Search size={16} className="mr-2" />
+          <span>{t("retrievingDocuments")}&nbsp;</span>
+          <span className="max-w-[500px] overflow-hidden text-ellipsis whitespace-nowrap">
+            {query}
+          </span>
+        </RainbowText>
+      </div>
+
+      <div className="pr-4">
+        <ul className="mt-2 flex flex-wrap gap-3">
+          {/* skeleton loading */}
+          {searching &&
+            [...Array(2)].map((_, i) => (
+              <li
+                key={`skeleton-${i}`}
+                className="flex h-24 w-44 gap-2 rounded-md text-sm"
+              >
+                <Skeleton
+                  className="to-accent h-full w-full rounded-md bg-gradient-to-tl from-slate-400"
+                  style={{ animationDelay: `${i * 0.2}s` }}
+                />
+              </li>
+            ))}
+
+          {/* document cards */}
+          {documents.map((doc, i) => (
+            <DocumentCard
+              key={`doc-${doc.title}-${i}`}
+              doc={doc}
+              index={i}
+            />
+          ))}
+        </ul>
+
+        {/* 结果统计 */}
+        {!searching && documents.length > 0 && (
+          <p className="text-muted-foreground/50 mt-1 text-xs">
+            找到 {documents.length} 份文档，
+            共 {documents.reduce((sum, d) => sum + d.chunkCount, 0)} 个段落
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  CrawlToolCall（crawl_tool / fetch_tool）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function CrawlToolCall({ toolCall }: { toolCall: ToolCallRuntime }) {
+  const t = useTranslations("chat.research");
+  const toolName = (toolCall as any).name ?? "crawl_tool";
+  const isFetch = toolName === "fetch_tool";
+
+  const url = useMemo(
+    () => (toolCall.args as { url?: string }).url ?? "",
+    [toolCall.args],
+  );
+
+  const loading = toolCall.result === undefined;
+
+  const docInfo = useMemo<DocumentSummary>(() => {
+    const artifact = getArtifact(toolCall);
+    const doc = artifact?.documents?.[0];
+    if (doc) {
+      return {
+        title: doc.document_title,
+        url: doc.document_url ?? url,
+        fileId: doc.file_id,
+        chunkCount: doc.chunks.length,
+        isExtracted: doc.is_extracted,
+      };
+    }
+
+    if (typeof toolCall.result === "string") {
+      const parsed = extractDocsFromMarkdown(toolCall.result);
+      const first = parsed[0];
+      if (first) {
+        return {
+          title: first.title,
+          url: first.url ?? url,
+          fileId: first.fileId,
+          chunkCount: first.chunkCount,
+          isExtracted: first.isExtracted,
+        };
+      }
+    }
+
+    return {
+      title: __pageCache.get(url) ?? url,
+      url,
+      fileId: null,
+      chunkCount: 0,
+      isExtracted: typeof toolCall.result === "string"
+        && toolCall.result.includes("【截取结果】"),
+    };
+  }, [toolCall.result, url]);
+
   return (
     <section className="mt-4 pl-4">
       <div>
         <RainbowText
           className="flex items-center text-base font-medium italic"
-          animated={toolCall.result === undefined}
+          animated={loading}
         >
-          <BookOpenText size={16} className={"mr-2"} />
-          <span>{t("reading")}</span>
+          {isFetch
+            ? <Download size={16} className="mr-2" />
+            : <BookOpenText size={16} className="mr-2" />
+          }
+          <span>{isFetch ? t("fetching") : t("reading")}</span>
         </RainbowText>
       </div>
-      <ul className="mt-2 flex flex-wrap gap-4">
-        <motion.li
-          className="text-muted-foreground bg-accent flex h-40 w-40 gap-2 rounded-md px-2 py-1 text-sm"
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{
-            duration: 0.15, // Reduced for better performance
-            ease: "easeOut",
-          }}
-        >
-          <FavIcon className="mt-1" url={url} title={title} />
-          <a
-            className="h-full flex-grow overflow-hidden text-ellipsis whitespace-nowrap"
-            href={url}
-            target="_blank"
-          >
-            {title ?? url}
-          </a>
-        </motion.li>
-      </ul>
-    </section>
-  );
-}
 
-function RetrieverToolCall({ toolCall }: { toolCall: ToolCallRuntime }) {
-  const t = useTranslations("chat.research");
-  const searching = useMemo(() => {
-    return toolCall.result === undefined;
-  }, [toolCall.result]);
-  const documents = useMemo<
-    Array<{ id: string; title: string; content: string }>
-  >(() => {
-    return toolCall.result ? parseJSON(toolCall.result, []) : [];
-  }, [toolCall.result]);
-  return (
-    <section className="mt-4 pl-4">
-      <div className="font-medium italic">
-        <RainbowText className="flex items-center" animated={searching}>
-          <Search size={16} className={"mr-2"} />
-          <span>{t("retrievingDocuments")}&nbsp;</span>
-          <span className="max-w-[500px] overflow-hidden text-ellipsis whitespace-nowrap">
-            {(toolCall.args as { keywords: string }).keywords}
-          </span>
-        </RainbowText>
-      </div>
-      <div className="pr-4">
-        {documents && (
-          <ul className="mt-2 flex flex-wrap gap-4">
-            {searching &&
-              [...Array(2)].map((_, i) => (
-                <li
-                  key={`search-result-${i}`}
-                  className="flex h-40 w-40 gap-2 rounded-md text-sm"
-                >
-                  <Skeleton
-                    className="to-accent h-full w-full rounded-md bg-gradient-to-tl from-slate-400"
-                    style={{ animationDelay: `${i * 0.2}s` }}
-                  />
-                </li>
-              ))}
-            {documents?.map((doc, i) => {
-              const shouldAnimate = i < 4; // Only animate first 4 documents
-              return (
-                <motion.li
-                  key={`search-result-${i}`}
-                  className="text-muted-foreground bg-accent flex max-w-40 gap-2 rounded-md px-2 py-1 text-sm"
-                  initial={shouldAnimate ? { opacity: 0, y: 10 } : { opacity: 1, y: 0 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={shouldAnimate ? {
-                    duration: 0.15,
-                    delay: Math.min(i * 0.05, 0.2),
-                    ease: "easeOut",
-                  } : undefined}
-                >
-                  <FileText size={32} />
-                  {doc.title} (chunk-{i},size-{doc.content.length})
-                </motion.li>
-              );
-            })}
-          </ul>
+      <ul className="mt-2 flex flex-wrap gap-3">
+        {loading ? (
+          <li className="flex h-24 w-56 rounded-md">
+            <Skeleton className="to-accent h-full w-full rounded-md bg-gradient-to-tl from-slate-400" />
+          </li>
+        ) : (
+          <motion.li
+            className="bg-accent text-muted-foreground flex w-56 flex-col gap-1.5 rounded-md px-3 py-2 text-sm"
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.15, ease: "easeOut" }}
+          >
+            {/* 标题 + favicon */}
+            <div className="flex items-start gap-2">
+              {docInfo.url && (
+                <FavIcon className="mt-0.5" url={docInfo.url} title={docInfo.title} />
+              )}
+              <a
+                className="line-clamp-2 flex-grow text-xs leading-snug hover:underline"
+                href={docInfo.url ?? undefined}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {docInfo.title}
+              </a>
+            </div>
+
+            {/* 元信息 */}
+            <div className="text-muted-foreground/60 flex items-center gap-2 text-[11px]">
+              {docInfo.chunkCount > 0 && (
+                <span>{docInfo.chunkCount} 个段落</span>
+              )}
+              {docInfo.isExtracted && (
+                <span className="bg-amber-500/10 text-amber-600 inline-flex items-center gap-0.5 rounded px-1">
+                  <Scissors size={10} />
+                  截取
+                </span>
+              )}
+              {docInfo.fileId && (
+                <span className="text-muted-foreground/40">{docInfo.fileId}</span>
+              )}
+            </div>
+          </motion.li>
         )}
-      </div>
+      </ul>
     </section>
   );
 }

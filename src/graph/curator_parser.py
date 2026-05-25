@@ -8,7 +8,7 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 
 from planner_model import CPPlannerOutput, CPPointAnalystOutput
-from .curator_models import CuratorOutput, Relevance
+from .curator_models import CuratorOutput, Relevance, normalize_doc_title
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,105 @@ def _count_discarded(discarded_text: str) -> int:
     return max(data_rows, 0)
 
 
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  1. 从 tool_returns_cache 提取 citations
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def extract_citations_from_cache(
+    cache: list["ToolCallRecord"],
+) -> list[dict[str, Any]]:
+    """
+    从 Searcher 的 tool_returns_cache 中提取去重后的 citation 列表。
+
+    每个 citation 结构:
+    {
+        "title":       str,   # 文档标题
+        "url":         str,   # 文档 URL（可能为空）
+        "file_id":     str,   # 知识库文档编号（可能为空）
+        "description": str,   # 文档分类描述
+        "source_tool": str,   # 来源工具 "local_search_tool" | "crawl_tool" | "fetch_tool"
+        "is_extracted": bool, # 是否经过截取
+    }
+    """
+    citations: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    for record in cache:
+        if record.artifact is None:
+            continue
+
+        for doc in record.artifact.documents:
+            # 去重 key: 优先用 url，其次用归一化 title
+            key = _citation_dedup_key(doc.document_title, doc.document_url)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            citations.append({
+                "title": doc.document_title,
+                "url": doc.document_url or "",
+                "file_id": doc.file_id or "",
+                "description": doc.description or "",
+                "source_tool": record.tool_name,
+                "is_extracted": doc.is_extracted,
+            })
+
+    return citations
+
+
+def _citation_dedup_key(title: str, url: str | None) -> str:
+    """生成 citation 去重 key。优先用 url，无 url 则用归一化 title。"""
+    if url:
+        return f"url:{url.strip()}"
+    return f"title:{normalize_doc_title(title)}"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  2. 跨步骤 merge
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def merge_citations(
+    existing: list[dict[str, Any]],
+    new: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    将新 citations 合并到 existing，保持插入顺序，URL/title 去重。
+
+    合并策略:
+    - 已存在的 citation 保留原始位置
+    - 新 citation 追加到末尾
+    - 同一文档出现在多个工具中时，优先保留 crawl/fetch 的元数据
+      （因为 crawl/fetch 有更完整的文档信息）
+    """
+    result = list(existing)
+    seen_keys: set[str] = set()
+
+    for c in result:
+        seen_keys.add(_citation_dedup_key(c.get("title", ""), c.get("url")))
+
+    for c in new:
+        key = _citation_dedup_key(c.get("title", ""), c.get("url"))
+        if key in seen_keys:
+            # 已存在：如果新的来自 crawl/fetch 且旧的来自 local_search，用新的更新
+            if c.get("source_tool") in ("crawl_tool", "fetch_tool"):
+                for i, existing_c in enumerate(result):
+                    existing_key = _citation_dedup_key(
+                        existing_c.get("title", ""), existing_c.get("url")
+                    )
+                    if existing_key == key and existing_c.get("source_tool") == "local_search_tool":
+                        # 保留原位置，更新元数据
+                        result[i] = {**existing_c, **c}
+                        break
+            continue
+        seen_keys.add(key)
+        result.append(c)
+
+    return result
+
+
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 通用 JSON 提取 + Pydantic 解析
 # ══════════════════════════════════════════════════════════════════════
@@ -197,3 +296,6 @@ def parse_planner_output(raw_text: str) -> CPPlannerOutput:
 def parse_point_analyst_output(raw_text: str) -> CPPointAnalystOutput:
     """解析 Point Analyst 输出"""
     return parse_model_from_text(raw_text, CPPointAnalystOutput)
+
+
+
