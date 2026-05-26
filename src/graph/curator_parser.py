@@ -41,7 +41,8 @@ def parse_curator_output(text: str) -> CuratorOutput:
 
     # ── Step 3: 填充 ID 和计数 ──
     for idx, evidence in enumerate(output.evidences):
-        evidence.id = idx + 1
+        evidence.id = str(idx + 1)
+        _enrich_evidence(evidence)
 
     output.retained_count = len(output.evidences)
     output.direct_count = sum(
@@ -53,7 +54,8 @@ def parse_curator_output(text: str) -> CuratorOutput:
     output.uncertain_count = sum(
         1 for e in output.evidences if e.relevance == Relevance.UNCERTAIN
     )
-
+    output.expired_count = sum(1 for e in output.evidences if e.is_expired)
+    output.tool_extracted_count = sum(1 for e in output.evidences if e.is_tool_extracted)
     # discarded_count：尝试从 discarded 文本中计数表格行
     output.discarded_count = _count_discarded(output.discarded)
     output.total_input_count = output.retained_count + output.discarded_count

@@ -45,21 +45,35 @@ def _find_content_boundary(body: str) -> tuple[str, str]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+_INDIRECT_CONTENT_PREVIEW_LIMIT = 300
+
+
 def _format_evidence_for_analyst(e: EvidenceItem) -> str:
     """
-    分析视图：
-    - 直接相关 → 完整 body（含具体内容）
-    - 间接相关 / 存疑 → 仅 metadata（不含具体内容）
+    分析视图（改造后）：
+    - 直接相关 → 完整 body
+    - 间接相关 / 存疑 → metadata + 具体内容截断预览
     """
     if e.relevance == Relevance.DIRECT:
         return f"**业务依据 {e.id}**\n{e.body}"
-    else:
-        metadata, _ = _find_content_boundary(e.body)
-        return f"**业务依据 {e.id}**\n{metadata}"
+
+    metadata, content = _find_content_boundary(e.body)
+
+    parts = [f"**业务依据 {e.id}**", metadata]
+
+    # ← 新增：具体内容截断预览，供 Analyst 交叉核实摘引
+    if content:
+        preview = content[:_INDIRECT_CONTENT_PREVIEW_LIMIT]
+        if len(content) > _INDIRECT_CONTENT_PREVIEW_LIMIT:
+            preview += "\n…[具体内容已截断，以上为前部预览]"
+        parts.append(f"具体内容预览：\n{preview}")
+
+    return "\n".join(parts)
+
 
 
 def generate_analysis_view(output: CuratorOutput) -> str:
-    """Analyst 视图：直接相关含全文，其余仅 metadata + 统计概览。"""
+    """Analyst 视图：直接相关含全文，其余仅 metadata + 预览 + 统计概览。"""
     parts: list[str] = []
 
     # ── 统计概览（新增）──

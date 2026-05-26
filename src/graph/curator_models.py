@@ -70,35 +70,6 @@ class CuratorOutput(BaseModel):
 #  解析
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-class CuratorParseError(Exception):
-    """Curator 解析失败"""
-
-
-def parse_curator_output(text: str) -> CuratorOutput:
-    text = text.strip()
-    data = _load_json(text)
-
-    try:
-        output = CuratorOutput.model_validate(data)
-    except Exception as e:
-        raise CuratorParseError(f"Pydantic 校验失败: {e}") from e
-
-    for idx, evidence in enumerate(output.evidences):
-        evidence.id = str(idx + 1)
-        _enrich_evidence(evidence)
-
-    output.retained_count = len(output.evidences)
-    output.direct_count = sum(1 for e in output.evidences if e.relevance == Relevance.DIRECT)
-    output.indirect_count = sum(1 for e in output.evidences if e.relevance == Relevance.INDIRECT)
-    output.uncertain_count = sum(1 for e in output.evidences if e.relevance == Relevance.UNCERTAIN)
-    output.expired_count = sum(1 for e in output.evidences if e.is_expired)
-    output.tool_extracted_count = sum(1 for e in output.evidences if e.is_tool_extracted)
-    output.discarded_count = _count_discarded(output.discarded)
-    output.total_input_count = output.retained_count + output.discarded_count
-
-    return output
-
-
 def _enrich_evidence(evidence: EvidenceItem) -> None:
     """从 body 文本解析结构化字段，就地更新。"""
     for line in evidence.body.split("\n"):
