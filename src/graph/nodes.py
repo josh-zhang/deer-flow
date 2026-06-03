@@ -37,6 +37,7 @@ from src.utils.json_utils import repair_json_output, sanitize_tool_response
 from .types import State
 from .utils import (
     build_clarified_topic_from_history,
+    format_attached_files_for_prompt,
     get_latest_user_message,
     get_message_content,
     reconstruct_clarification_history,
@@ -770,6 +771,9 @@ async def researcher_node(state: State, config: RunnableConfig) -> dict:
         f"## 已完成步骤检索摘要\n{summaries}\n\n"
         f"## 当前步骤\n- 标题：{step.title}\n- 背景：{step.background}\n- 检索内容：{step.description}\n"
     )
+    attachments_block = format_attached_files_for_prompt(state)
+    if attachments_block:
+        user += f"\n## 用户附件\n\n{attachments_block}\n"
     rs = _research_steps(plan)
     step_no = next((i + 1 for i, s in enumerate(rs) if s is step), 0)
 

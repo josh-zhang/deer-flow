@@ -111,3 +111,79 @@ def reconstruct_clarification_history(
 
     base_topic = (base_topic or "").strip()
     return [base_topic] if base_topic else []
+
+
+# ───────────────────────────────────────────────────────────
+# User-attached file helpers (state["attached_files"])
+# ───────────────────────────────────────────────────────────
+
+# Per-file text truncation when injecting into a prompt. Keeps the prompt
+# bounded even when a user uploads a multi-MB plain-text file. Smarter
+# chunking can replace this later.
+ATTACHED_TEXT_MAX_CHARS = 50_000
+
+
+def format_attached_files_for_prompt(
+    state: Any, max_chars_per_file: int = ATTACHED_TEXT_MAX_CHARS
+) -> str:
+    """Render state["attached_files"] as a markdown block for prompt injection.
+
+    Text files: full content under a `## File: <name>` heading (truncated if
+    over `max_chars_per_file`).
+    Images: a one-line listing (binary is passed via vision messages, not text).
+    Returns an empty string when there are no attachments — callers can
+    unconditionally concatenate.
+    """
+    files = (state or {}).get("attached_files") or []
+    if not files:
+        return ""
+
+    sections: list[str] = []
+    for f in files:
+        name = f.get("name", "unnamed")
+        kind = f.get("kind")
+        if kind == "text":
+            content = f.get("text") or ""
+            truncated = False
+            if len(content) > max_chars_per_file:
+                content = content[:max_chars_per_file]
+                truncated = True
+            suffix = (
+                f"\n\n…[truncated, original {f.get('size_bytes', 0)} bytes]"
+                if truncated
+                else ""
+            )
+            sections.append(f"### File: {name}\n\n{content}{suffix}")
+        elif kind == "image":
+            sections.append(
+                f"- [image attachment: {name}, "
+                f"{f.get('mime', '')}, {f.get('size_bytes', 0)} bytes]"
+            )
+        else:
+            sections.append(f"- [unknown attachment: {name}]")
+
+    return "\n\n".join(sections)
+
+
+def get_attached_images(state: Any) -> list[dict[str, str]]:
+    """Return image attachments shaped for multimodal LangChain messages.
+
+    Each entry: {"name", "mime", "b64"}. Empty list when there are no
+    image attachments.
+    """
+    files = (state or {}).get("attached_files") or []
+    out: list[dict[str, str]] = []
+    for f in files:
+        if f.get("kind") != "image":
+            continue
+        b64 = f.get("b64")
+        if not b64:
+            continue
+        out.append(
+            {
+                "name": f.get("name", "unnamed"),
+                "mime": f.get("mime", "application/octet-stream"),
+                "b64": b64,
+            }
+        )
+    return out

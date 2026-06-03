@@ -26,6 +26,20 @@ export interface Message {
   interruptFeedback?: string;
   resources?: Array<Resource>;
   citations?: Array<Citation>;
+  attachments?: Array<AttachedFile>;
+}
+
+export type AttachedFileKind = "text" | "image";
+
+export interface AttachedFile {
+  id: string;
+  message_id: string;
+  name: string;
+  mime: string;
+  kind: AttachedFileKind;
+  size_bytes: number;
+  text?: string;
+  b64?: string;
 }
 
 export interface Option {

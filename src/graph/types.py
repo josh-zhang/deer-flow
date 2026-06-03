@@ -127,3 +127,14 @@ class State(MessagesState):
     # ═══════════════════════════════════════════════════
     document_metadata: dict[str, dict] = field(default_factory=dict)
     # {document_title: {"document_url", "file_id", "description", "is_extracted", "source_tools"}}
+
+    # ═══════════════════════════════════════════════════
+    #  User-attached Files — 跨轮累积
+    #  用途：前端 /chat 输入框上传的文件（文本 / 图片），节点可直接读取
+    #  Entry shape:
+    #    {id, message_id, name, mime, kind ("text"|"image"),
+    #     size_bytes, text (when kind=="text"), b64 (when kind=="image")}
+    # ═══════════════════════════════════════════════════
+    attached_files: Annotated[list[dict[str, Any]], operator.add] = field(
+        default_factory=list
+    )

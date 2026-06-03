@@ -262,6 +262,8 @@ async def chat_stream(request: ChatRequest):
     if thread_id == "__default__":
         thread_id = str(uuid4())
 
+    cleaned_attachments = _validate_attached_files(request.attached_files)
+
     return StreamingResponse(
         _astream_workflow_generator(
             request.model_dump()["messages"],
@@ -281,6 +283,7 @@ async def chat_stream(request: ChatRequest):
             request.max_clarification_rounds,
             request.locale,
             request.interrupt_before_tools,
+            cleaned_attachments,
         ),
         media_type="text/event-stream",
     )
@@ -774,6 +777,7 @@ async def _astream_workflow_generator(
     max_clarification_rounds: int,
     locale: str = "en-US",
     interrupt_before_tools: Optional[List[str]] = None,
+    attached_files: Optional[List[dict]] = None,
 ):
     safe_thread_id = sanitize_thread_id(thread_id)
     safe_feedback = sanitize_log_input(interrupt_feedback) if interrupt_feedback else ""
@@ -821,7 +825,15 @@ async def _astream_workflow_generator(
         "enable_clarification": enable_clarification,
         "max_clarification_rounds": max_clarification_rounds,
         "locale": locale,
+        # New attachments for this turn; State.attached_files uses operator.add
+        # so checkpointer-resumed prior-turn attachments are preserved.
+        "attached_files": attached_files or [],
     }
+    if attached_files:
+        logger.debug(
+            f"[{safe_thread_id}] Received {len(attached_files)} attached file(s) "
+            f"this turn: {[(a['name'], a['kind']) for a in attached_files]}"
+        )
 
     if not auto_accepted_plan and interrupt_feedback:
         logger.debug(f"[{safe_thread_id}] Creating resume command with interrupt_feedback: {safe_feedback}")
@@ -1213,6 +1225,16 @@ async def rag_resources(request: Annotated[RAGResourceRequest, Query()]):
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 ALLOWED_EXTENSIONS = {".md", ".txt"}
 
+# MIME types accepted on the /chat input box's file attachments. RAG upload
+# (`/api/rag/upload`) keeps its own allow-list above; these are for ad-hoc,
+# per-message attachments that live in graph state.
+ATTACHMENT_ALLOWED_MIMES = {
+    "text/plain": "text",
+    "image/png": "image",
+    "image/jpeg": "image",
+}
+MAX_ATTACHMENTS_PER_REQUEST = 5
+
 
 def _sanitize_filename(filename: str) -> str:
     """Sanitize filename to prevent path traversal attacks."""
@@ -1224,6 +1246,59 @@ def _sanitize_filename(filename: str) -> str:
     if not sanitized or sanitized in (".", ".."):
         return "unnamed_file"
     return sanitized
+
+
+def _validate_attached_files(files):
+    """Validate per-request file attachments and return cleaned dict entries.
+
+    Raises HTTPException(400/413) on invalid input. Each entry returned is
+    safe to drop straight into State["attached_files"].
+    """
+    if not files:
+        return []
+    if len(files) > MAX_ATTACHMENTS_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many attachments. Max {MAX_ATTACHMENTS_PER_REQUEST} per request.",
+        )
+
+    cleaned: list[dict] = []
+    for f in files:
+        expected_kind = ATTACHMENT_ALLOWED_MIMES.get(f.mime)
+        if expected_kind is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported attachment mime '{f.mime}'. Allowed: "
+                    f"{', '.join(sorted(ATTACHMENT_ALLOWED_MIMES))}."
+                ),
+            )
+        if expected_kind != f.kind:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Attachment kind '{f.kind}' does not match mime '{f.mime}'.",
+            )
+        if f.size_bytes > MAX_UPLOAD_SIZE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Attachment '{f.name}' too large. "
+                    f"Max {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)} MB."
+                ),
+            )
+        cleaned.append(
+            {
+                "id": f.id,
+                "message_id": f.message_id,
+                "name": _sanitize_filename(f.name),
+                "mime": f.mime,
+                "kind": f.kind,
+                "size_bytes": f.size_bytes,
+                "text": f.text,
+                "b64": f.b64,
+            }
+        )
+    return cleaned
 
 
 @app.post("/api/rag/upload", response_model=Resource)

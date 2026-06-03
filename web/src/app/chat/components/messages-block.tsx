@@ -16,7 +16,7 @@ import {
 } from "~/components/ui/card";
 import { fastForwardReplay } from "~/core/api";
 import { useReplayMetadata } from "~/core/api/hooks";
-import type { Option, Resource } from "~/core/messages";
+import type { AttachedFile, Option, Resource } from "~/core/messages";
 import { useReplay } from "~/core/replay";
 import { sendMessage, useMessageIds, useStore } from "~/core/store";
 import { env } from "~/env";
@@ -43,6 +43,7 @@ export function MessagesBlock({ className }: { className?: string }) {
       options?: {
         interruptFeedback?: string;
         resources?: Array<Resource>;
+        attachments?: Array<AttachedFile>;
       },
     ) => {
       const abortController = new AbortController();
@@ -54,6 +55,7 @@ export function MessagesBlock({ className }: { className?: string }) {
             interruptFeedback:
               options?.interruptFeedback ?? feedback?.option.value,
             resources: options?.resources,
+            attachments: options?.attachments,
           },
           {
             abortSignal: abortController.signal,

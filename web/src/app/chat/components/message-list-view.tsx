@@ -9,6 +9,7 @@ import {
   ChevronDown,
   ChevronRight,
   Lightbulb,
+  Paperclip,
   Wrench,
 } from "lucide-react";
 import { useTranslations } from "next-intl";
@@ -36,7 +37,7 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "~/components/ui/collapsible";
-import type { Message, Option } from "~/core/messages";
+import type { AttachedFile, Message, Option } from "~/core/messages";
 import {
   closeResearch,
   openResearch,
@@ -178,28 +179,39 @@ function MessageListItem({
           </div>
         );
       } else {
-        content = message.content ? (
-          <div
-            className={cn(
-              "flex w-full px-4",
-              message.role === "user" && "justify-end",
-              className,
-            )}
-          >
-            <MessageBubble message={message}>
-              <div className="flex w-full flex-col break-words">
-                <Markdown
-                  className={cn(
-                    message.role === "user" &&
-                      "prose-invert not-dark:text-secondary dark:text-inherit",
+        const hasAttachments =
+          message.attachments && message.attachments.length > 0;
+        content =
+          message.content || hasAttachments ? (
+            <div
+              className={cn(
+                "flex w-full px-4",
+                message.role === "user" && "justify-end",
+                className,
+              )}
+            >
+              <MessageBubble message={message}>
+                <div className="flex w-full flex-col break-words">
+                  {hasAttachments && (
+                    <UserAttachments
+                      attachments={message.attachments!}
+                      isUserBubble={message.role === "user"}
+                    />
                   )}
-                >
-                  {message?.content}
-                </Markdown>
-              </div>
-            </MessageBubble>
-          </div>
-        ) : null;
+                  {message.content && (
+                    <Markdown
+                      className={cn(
+                        message.role === "user" &&
+                          "prose-invert not-dark:text-secondary dark:text-inherit",
+                      )}
+                    >
+                      {message?.content}
+                    </Markdown>
+                  )}
+                </div>
+              </MessageBubble>
+            </div>
+          ) : null;
       }
       if (content) {
         return (
@@ -221,6 +233,47 @@ function MessageListItem({
     }
     return null;
   }
+}
+
+function UserAttachments({
+  attachments,
+  isUserBubble,
+}: {
+  attachments: AttachedFile[];
+  isUserBubble: boolean;
+}) {
+  return (
+    <div className="mb-2 flex flex-wrap gap-2">
+      {attachments.map((a) => {
+        const sizeKB = (a.size_bytes / 1024).toFixed(1);
+        return (
+          <div
+            key={a.id}
+            className={cn(
+              "flex items-center gap-2 rounded-md border px-2 py-1 text-xs",
+              isUserBubble
+                ? "border-white/20 bg-white/10"
+                : "bg-muted/60 border-border",
+            )}
+            title={`${a.name} (${a.mime}, ${sizeKB} KB)`}
+          >
+            {a.kind === "image" && a.b64 ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={`data:${a.mime};base64,${a.b64}`}
+                alt={a.name}
+                className="h-8 w-8 rounded object-cover"
+              />
+            ) : (
+              <Paperclip className="h-3.5 w-3.5 opacity-70" />
+            )}
+            <span className="max-w-[180px] truncate">{a.name}</span>
+            <span className="opacity-60">{sizeKB} KB</span>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function MessageBubble({

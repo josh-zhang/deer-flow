@@ -1,12 +1,44 @@
 # Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: MIT
 
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src.config.report_style import ReportStyle
 from src.rag.retriever import Resource
+
+
+class AttachedFile(BaseModel):
+    """A file attached to a user message via the /chat input box.
+
+    Text files carry their UTF-8 decoded content in `text`; images carry
+    their bytes as base64 in `b64`. Validated at the API boundary; nodes
+    can read these directly from state["attached_files"].
+    """
+
+    id: str = Field(..., description="Client-generated id (nanoid)")
+    message_id: str = Field(
+        ..., description="Id of the user message this file was attached to"
+    )
+    name: str = Field(..., description="Original filename (sanitized server-side)")
+    mime: str = Field(..., description="MIME type")
+    kind: Literal["text", "image"] = Field(..., description="Attachment kind")
+    size_bytes: int = Field(..., ge=0, description="Raw file size in bytes")
+    text: Optional[str] = Field(
+        None, description="UTF-8 decoded content (required when kind=='text')"
+    )
+    b64: Optional[str] = Field(
+        None, description="Base64-encoded bytes (required when kind=='image')"
+    )
+
+    @model_validator(mode="after")
+    def _validate_payload(self) -> "AttachedFile":
+        if self.kind == "text" and self.text is None:
+            raise ValueError("AttachedFile.text is required when kind=='text'")
+        if self.kind == "image" and not self.b64:
+            raise ValueError("AttachedFile.b64 is required when kind=='image'")
+        return self
 
 
 class ContentItem(BaseModel):
@@ -82,6 +114,12 @@ class ChatRequest(BaseModel):
     interrupt_before_tools: List[str] = Field(
         default_factory=list,
         description="List of tool names to interrupt before execution (e.g., ['db_tool', 'api_tool'])",
+    )
+    attached_files: Optional[List[AttachedFile]] = Field(
+        default_factory=list,
+        description="Files attached to the current user message (text or image). "
+        "Travel with the request and become available to graph nodes via "
+        "state['attached_files']. Accumulates across turns of the same thread.",
     )
 
 

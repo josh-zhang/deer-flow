@@ -127,6 +127,11 @@
         "description": "When enabled, DeerFlow will perform a quick search before planning. This is useful for researches related to ongoing events and news."
       },
       "enhancePrompt": "Enhance prompt with AI",
+      "attach": "Attach files (.txt, .png, .jpg)",
+      "attachmentLimit": "You can attach up to {max} files per message.",
+      "attachmentUnsupported": "Unsupported file type: {name}. Only .txt, .png, .jpg are allowed.",
+      "attachmentTooLarge": "{name} is too large. Max {max} MB per file.",
+      "attachmentReadFailed": "Failed to read {name}",
       "on": "On",
       "off": "Off"
     },

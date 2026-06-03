@@ -4,7 +4,7 @@
 import { env } from "~/env";
 
 import type { MCPServerMetadata } from "../mcp";
-import type { Resource } from "../messages";
+import type { AttachedFile, Resource } from "../messages";
 import { extractReplayIdFromSearchParams } from "../replay/get-replay-id";
 import { fetchStream } from "../sse";
 import { sleep } from "../utils";
@@ -62,6 +62,7 @@ export async function* chatStream(
         }
       >;
     };
+    attached_files?: Array<AttachedFile>;
   },
   options: { abortSignal?: AbortSignal } = {},
 ) {

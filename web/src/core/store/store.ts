@@ -7,7 +7,12 @@ import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 
 import { chatStream, generatePodcast } from "../api";
-import type { Citation, Message, Resource } from "../messages";
+import type {
+  AttachedFile,
+  Citation,
+  Message,
+  Resource,
+} from "../messages";
 import { mergeMessage } from "../messages";
 import { parseJSON } from "../utils";
 
@@ -95,20 +100,31 @@ export async function sendMessage(
   {
     interruptFeedback,
     resources,
+    attachments,
   }: {
     interruptFeedback?: string;
     resources?: Array<Resource>;
+    attachments?: Array<AttachedFile>;
   } = {},
   options: { abortSignal?: AbortSignal } = {},
 ) {
+  // Stamp attachments with the new user-message id so the backend can correlate
+  // an attached file with the turn that uploaded it.
+  let stampedAttachments: Array<AttachedFile> | undefined;
   if (content != null) {
+    const userMessageId = nanoid();
+    stampedAttachments = attachments?.map((a) => ({
+      ...a,
+      message_id: userMessageId,
+    }));
     appendMessage({
-      id: nanoid(),
+      id: userMessageId,
       threadId: THREAD_ID,
       role: "user",
       content: content,
       contentChunks: [content],
       resources,
+      attachments: stampedAttachments,
     });
   }
 
@@ -119,6 +135,7 @@ export async function sendMessage(
       thread_id: THREAD_ID,
       interrupt_feedback: interruptFeedback,
       resources,
+      attached_files: stampedAttachments,
       auto_accepted_plan: settings.autoAcceptedPlan,
       enable_clarification: settings.enableClarification ?? false,
       max_clarification_rounds: settings.maxClarificationRounds ?? 3,

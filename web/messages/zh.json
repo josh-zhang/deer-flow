@@ -121,6 +121,11 @@
         "description": "启用后将在规划前进行快速搜索。这对于与时事和新闻相关的研究很有用。"
       },
       "enhancePrompt": "用 AI 增强提示",
+      "attach": "附加文件（.txt、.png、.jpg）",
+      "attachmentLimit": "每条消息最多附加 {max} 个文件。",
+      "attachmentUnsupported": "不支持的文件类型：{name}。仅允许 .txt、.png、.jpg。",
+      "attachmentTooLarge": "{name} 过大。单个文件上限 {max} MB。",
+      "attachmentReadFailed": "无法读取文件：{name}",
       "on": "开启",
       "off": "关闭"
     },

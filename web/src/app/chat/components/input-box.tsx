@@ -3,9 +3,11 @@
 
 import { MagicWandIcon } from "@radix-ui/react-icons";
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowUp, Lightbulb, X } from "lucide-react";
+import { ArrowUp, Lightbulb, Paperclip, X } from "lucide-react";
+import { nanoid } from "nanoid";
 import { useTranslations } from "next-intl";
 import { useCallback, useRef, useState } from "react";
+import { toast } from "sonner";
 
 import { Detective } from "~/components/deer-flow/icons/detective";
 import MessageInput, {
@@ -17,13 +19,52 @@ import { BorderBeam } from "~/components/magicui/border-beam";
 import { Button } from "~/components/ui/button";
 import { enhancePrompt } from "~/core/api";
 import { useConfig } from "~/core/api/hooks";
-import type { Option, Resource } from "~/core/messages";
+import type { AttachedFile, Option, Resource } from "~/core/messages";
 import {
   setEnableDeepThinking,
   setEnableBackgroundInvestigation,
   useSettingsStore,
 } from "~/core/store";
 import { cn } from "~/lib/utils";
+
+// Mirrors the backend allow-list in src/server/app.py
+const ATTACHMENT_ACCEPT = ".txt,.png,.jpg,.jpeg";
+const ATTACHMENT_MIME_TO_KIND: Record<string, "text" | "image"> = {
+  "text/plain": "text",
+  "image/png": "image",
+  "image/jpeg": "image",
+};
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENTS = 5;
+
+function readFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => resolve(reader.result as string);
+    reader.readAsText(file, "utf-8");
+  });
+}
+
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Strip the "data:<mime>;base64," prefix
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 export function InputBox({
   className,
@@ -42,6 +83,7 @@ export function InputBox({
     options?: {
       interruptFeedback?: string;
       resources?: Array<Resource>;
+      attachments?: Array<AttachedFile>;
     },
   ) => void;
   onCancel?: () => void;
@@ -60,32 +102,106 @@ export function InputBox({
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<MessageInputRef>(null);
   const feedbackRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Enhancement state
   const [isEnhancing, setIsEnhancing] = useState(false);
   const [isEnhanceAnimating, setIsEnhanceAnimating] = useState(false);
   const [currentPrompt, setCurrentPrompt] = useState("");
 
+  // Attachment state — message_id is filled in by the store at submit time
+  const [attachments, setAttachments] = useState<Array<AttachedFile>>([]);
+
+  const handleAttachClick = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleFilesSelected = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const picked = Array.from(e.target.files ?? []);
+      // Always reset so picking the same file twice re-fires onChange
+      e.target.value = "";
+      if (picked.length === 0) return;
+
+      const remainingSlots = MAX_ATTACHMENTS - attachments.length;
+      if (remainingSlots <= 0) {
+        toast.error(t("attachmentLimit", { max: MAX_ATTACHMENTS }));
+        return;
+      }
+      const accepted = picked.slice(0, remainingSlots);
+      if (picked.length > accepted.length) {
+        toast.warning(t("attachmentLimit", { max: MAX_ATTACHMENTS }));
+      }
+
+      const additions: AttachedFile[] = [];
+      for (const file of accepted) {
+        const kind = ATTACHMENT_MIME_TO_KIND[file.type];
+        if (!kind) {
+          toast.error(t("attachmentUnsupported", { name: file.name }));
+          continue;
+        }
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          toast.error(
+            t("attachmentTooLarge", {
+              name: file.name,
+              max: MAX_ATTACHMENT_BYTES / (1024 * 1024),
+            }),
+          );
+          continue;
+        }
+        try {
+          const base: AttachedFile = {
+            id: nanoid(),
+            message_id: "", // stamped by sendMessage on submit
+            name: file.name,
+            mime: file.type,
+            kind,
+            size_bytes: file.size,
+          };
+          if (kind === "text") {
+            base.text = await readFileAsText(file);
+          } else {
+            base.b64 = await readFileAsBase64(file);
+          }
+          additions.push(base);
+        } catch (err) {
+          console.error("Failed to read attachment", file.name, err);
+          toast.error(t("attachmentReadFailed", { name: file.name }));
+        }
+      }
+      if (additions.length > 0) {
+        setAttachments((prev) => [...prev, ...additions]);
+      }
+    },
+    [attachments.length, t],
+  );
+
+  const handleRemoveAttachment = useCallback((id: string) => {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
   const handleSendMessage = useCallback(
     (message: string, resources: Array<Resource>) => {
       if (responding) {
         onCancel?.();
       } else {
-        if (message.trim() === "") {
+        if (message.trim() === "" && attachments.length === 0) {
           return;
         }
         if (onSend) {
           onSend(message, {
             interruptFeedback: feedback?.option.value,
             resources,
+            attachments: attachments.length > 0 ? attachments : undefined,
           });
           onRemoveFeedback?.();
+          setAttachments([]);
           // Clear enhancement animation after sending
           setIsEnhanceAnimating(false);
         }
       }
     },
-    [responding, onCancel, onSend, feedback, onRemoveFeedback],
+    [responding, onCancel, onSend, feedback, onRemoveFeedback, attachments],
   );
 
   const handleEnhancePrompt = useCallback(async () => {
@@ -199,10 +315,22 @@ export function InputBox({
             </motion.div>
           )}
         </AnimatePresence>
+        {attachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 px-4 pt-3">
+            {attachments.map((a) => (
+              <AttachmentChip
+                key={a.id}
+                attachment={a}
+                onRemove={handleRemoveAttachment}
+              />
+            ))}
+          </div>
+        )}
         <MessageInput
           className={cn(
             "h-24 px-4 pt-5",
             feedback && "pt-9",
+            attachments.length > 0 && "h-20 pt-3",
             isEnhanceAnimating && "transition-all duration-500",
           )}
           ref={inputRef}
@@ -276,6 +404,25 @@ export function InputBox({
           <ReportStyleDialog />
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept={ATTACHMENT_ACCEPT}
+            className="hidden"
+            onChange={handleFilesSelected}
+          />
+          <Tooltip title={t("attach")}>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="hover:bg-accent h-10 w-10"
+              onClick={handleAttachClick}
+              disabled={attachments.length >= MAX_ATTACHMENTS}
+            >
+              <Paperclip className="text-brand" />
+            </Button>
+          </Tooltip>
           <Tooltip title={t("enhancePrompt")}>
             <Button
               variant="ghost"
@@ -329,6 +476,43 @@ export function InputBox({
           />
         </>
       )}
+    </div>
+  );
+}
+
+function AttachmentChip({
+  attachment,
+  onRemove,
+}: {
+  attachment: AttachedFile;
+  onRemove: (id: string) => void;
+}) {
+  const tCommon = useTranslations("common");
+  const isImage = attachment.kind === "image";
+  return (
+    <div className="bg-muted/60 hover:bg-muted flex items-center gap-2 rounded-lg border px-2 py-1 text-xs">
+      {isImage && attachment.b64 ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={`data:${attachment.mime};base64,${attachment.b64}`}
+          alt={attachment.name}
+          className="h-6 w-6 rounded object-cover"
+        />
+      ) : (
+        <Paperclip className="h-4 w-4 opacity-70" />
+      )}
+      <span className="max-w-[160px] truncate" title={attachment.name}>
+        {attachment.name}
+      </span>
+      <span className="opacity-60">{formatBytes(attachment.size_bytes)}</span>
+      <button
+        type="button"
+        aria-label={tCommon("cancel")}
+        className="hover:bg-background ml-1 rounded p-0.5"
+        onClick={() => onRemove(attachment.id)}
+      >
+        <X className="h-3 w-3" />
+      </button>
     </div>
   );
 }
