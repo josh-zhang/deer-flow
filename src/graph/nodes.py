@@ -55,7 +55,7 @@ _RULE_DONE = "[规则拆分已完成]"
 
 @tool
 def handoff_to_planner(
-    research_topic: Annotated[str, "中信银行信用卡客户需求原文及澄清摘要。"],
+    research_topic: Annotated[str, "银行信用卡客户需求原文及澄清摘要。"],
     locale: Annotated[str, "用户语言区域，如 zh_CN。"],
     workflow_type: Annotated[str, "工作流类型：A / B / C / D。"],
     workflow_confidence: Annotated[str, "high / medium / low。"],
