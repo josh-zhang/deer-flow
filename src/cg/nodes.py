@@ -245,6 +245,11 @@ async def copy_strategist_node(state: CGState, config: RunnableConfig) -> dict:
     scene_empathy = cg_input.get("scene_empathy", True)
     relationship_temperature = cg_input.get("relationship_temperature", "warm")
     privacy_boundary = cg_input.get("privacy_boundary", "standard")
+    ab_test = cg_input.get("ab_test", False)
+    historical_ab_summary = cg_input.get("historical_ab_summary", "")
+
+    # 构建经验 Skill 注入文本
+    skill_text = _build_skill_injection(state.get("loaded_skills", []))
 
     sub_state = {
         **state,
@@ -255,6 +260,9 @@ async def copy_strategist_node(state: CGState, config: RunnableConfig) -> dict:
         "scene_empathy": str(scene_empathy),
         "relationship_temperature": relationship_temperature,
         "privacy_boundary": privacy_boundary,
+        "ab_test": str(ab_test),
+        "historical_ab_summary": historical_ab_summary or "（无历史数据）",
+        "skill_injection": skill_text or "（无经验库）",
         "current_date": _current_date(),
         "messages": [HumanMessage(content="请按照 Copy Strategist 流程输出文案策略 JSON。")],
     }
@@ -267,11 +275,13 @@ async def copy_strategist_node(state: CGState, config: RunnableConfig) -> dict:
         content = str(resp.content or "")
         copy_strategy_obj = parse_copy_strategy(content)
         copy_strategy = copy_strategy_obj.model_dump()
+        ab_plans = copy_strategy.get("ab_plans", [])
     except Exception as e:
         logger.exception("copy_strategist_node 失败: %s", e)
         copy_strategy = {"_error": str(e)}
+        ab_plans = []
 
-    return {"copy_strategy": copy_strategy}
+    return {"copy_strategy": copy_strategy, "ab_plans": ab_plans}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -279,13 +289,15 @@ async def copy_strategist_node(state: CGState, config: RunnableConfig) -> dict:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def copy_writer_node(state: CGState, config: RunnableConfig) -> dict:
-    """Phase 3：母版文案生成，逐版本(1+n)生成（纯 LLM）。"""
+    """Phase 3：母版文案生成，逐版本(1+n)生成（纯 LLM）。支持 AB 变体。"""
     configurable = Configuration.from_runnable_config(config)
     cg_input = _get_cg_input(state)
 
     product_facts = state.get("product_facts", {})
     compliance_rule_set = state.get("compliance_rule_set", {})
     copy_strategy = state.get("copy_strategy", {})
+    ab_test = cg_input.get("ab_test", False)
+    ab_plans: list[dict] = state.get("ab_plans", [])
 
     personas: list[str] = cg_input.get("personas", [])
     # 生成版本列表：universal + 每个客群
@@ -350,6 +362,63 @@ async def copy_writer_node(state: CGState, config: RunnableConfig) -> dict:
                 "body": f"[生成失败] {e}",
                 "_error": str(e),
             })
+
+        # ── AB 变体生成：当 ab_test=True 且该客群有 AB 方案时，额外生成 B 组母版 ──
+        if ab_test and variant_type != "universal":
+            ab_plan = next(
+                (p for p in ab_plans if p.get("persona_name") == variant_type), None
+            )
+            if ab_plan:
+                # 构建 B 组的 creative_strategy：覆盖实验变量
+                b_creative_strategy = dict(creative_strategy)
+                variable_tested = ab_plan.get("variable_tested", "")
+                group_b_value = ab_plan.get("group_b", "")
+                if variable_tested == "hook_type" and group_b_value:
+                    b_creative_strategy["marketing_hooks"] = [group_b_value]
+                elif variable_tested == "cta_style" and group_b_value:
+                    b_creative_strategy["cta_style_override"] = group_b_value
+                elif variable_tested == "tone" and group_b_value:
+                    b_creative_strategy["tone"] = group_b_value
+                elif variable_tested and group_b_value:
+                    b_creative_strategy[variable_tested] = group_b_value
+
+                b_sub_state = {
+                    **state,
+                    "variant_type": variant_type,
+                    "hard_constraints": _safe_json_dumps(hard_constraints),
+                    "creative_strategy": _safe_json_dumps(b_creative_strategy),
+                    "copy_structure": copy_structure,
+                    "current_date": _current_date(),
+                    "messages": [HumanMessage(content=(
+                        f"请为版本「{variant_type}」生成 B 组 AB 变体母版文案 JSON。\n"
+                        f"AB 实验变量：{variable_tested}，B 组取值：{group_b_value}。\n"
+                        f"请确保仅在 {variable_tested} 维度与 A 组不同，其余保持一致。"
+                    ))],
+                }
+
+                try:
+                    b_resp = await llm.ainvoke(
+                        apply_prompt_template("CG/copy_writer", b_sub_state, configurable)
+                    )
+                    b_content = str(b_resp.content or "")
+                    b_master_obj = parse_master_copy(b_content, variant_type=variant_type)
+                    b_dict = b_master_obj.model_dump()
+                    b_dict["ab_group"] = "B"
+                    b_dict["ab_variable"] = variable_tested
+                    b_dict["ab_label"] = group_b_value
+                    master_copies.append(b_dict)
+                except Exception as e:
+                    logger.exception(
+                        "copy_writer_node AB 变体版本「%s」失败: %s", variant_type, e
+                    )
+                    master_copies.append({
+                        "variant_type": variant_type,
+                        "body": f"[AB 变体生成失败] {e}",
+                        "ab_group": "B",
+                        "ab_variable": ab_plan.get("variable_tested", ""),
+                        "ab_label": ab_plan.get("group_b", ""),
+                        "_error": str(e),
+                    })
 
     return {"master_copies": master_copies}
 
@@ -865,3 +934,13 @@ def _apply_audience_tweaks(channel_copy: ChannelCopy, tweaks: list[str]) -> Chan
         "copy_text": copy_text,
         "char_count": len(copy_text),
     })
+
+
+def _build_skill_injection(skills: list[str]) -> str:
+    """将已加载的经验 Skill 列表格式化为 Prompt 注入文本。"""
+    if not skills:
+        return ""
+    parts = ["## 经验库（来自历史投放验证）", "以下经验经过多次实际投放验证，请在策略规划中优先参考。"]
+    for i, skill_content in enumerate(skills, 1):
+        parts.append(f"### 经验 {i}\n{skill_content}\n---")
+    return "\n".join(parts)

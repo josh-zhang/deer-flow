@@ -44,6 +44,8 @@ class CGInput(BaseModel):
     scene_empathy: bool = Field(default=True, description="是否启用场景化共情")
     relationship_temperature: str = Field(default="warm", description="关系温度: cold/warm/hot/rm_known")
     privacy_boundary: str = Field(default="standard", description="隐私边界: strict/standard/relaxed")
+    ab_test: bool = Field(default=False, description="是否输出A/B测试变体（启用后 Copy Writer 为有 AB 方案的组合生成两版母版）")
+    historical_ab_summary: str = Field(default="", description="历史 AB 实验结论（自然语言，按客群×渠道分组，由运营人员填写）")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -168,6 +170,7 @@ class CopyStrategy(BaseModel):
     hooks_library: dict[str, list[str]] = Field(default_factory=dict, description="钩子库，按类型分组")
     persona_channel_cards: list[PersonaChannelStyleCard] = Field(default_factory=list, description="客群×渠道交叉风格卡")
     channel_orchestration_notes: str = Field(default="", description="渠道协同策略说明")
+    ab_plans: list[dict[str, Any]] = Field(default_factory=list, description="AB 实验方案列表，每条含 persona_name/channel_name/variable_tested/group_a/group_b")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -184,6 +187,9 @@ class MasterCopy(BaseModel):
     compliance_footer: str = Field(default="", description="合规尾注")
     hooks_used: list[str] = Field(default_factory=list, description="使用的钩子类型")
     benefit_references: list[str] = Field(default_factory=list, description="权益引用追踪")
+    ab_group: str = Field(default="", description="AB 分组标记: A/B（空=非 AB）")
+    ab_variable: str = Field(default="", description="AB 实验变量名（如 hook_type）")
+    ab_label: str = Field(default="", description="AB 分组标签（如 损失规避）")
 
 
 class ChannelCopy(BaseModel):
@@ -375,6 +381,18 @@ class CGState(MessagesState):
     # ═══════════════════════════════════════════════════
     rewrite_iterations: int = 0
     max_rewrite_iterations: int = 2
+
+    # ═══════════════════════════════════════════════════
+    #  AB 实验与反馈闭环
+    # ═══════════════════════════════════════════════════
+    historical_ab_summary: str = ""
+    # 历史 AB 实验结论（自然语言，注入 Copy Strategist）
+    ab_plans: list[dict[str, Any]] = field(default_factory=list)
+    # Copy Strategist 输出的本批次 AB 方案
+    # [{"persona_name": "...", "channel_name": "...", "variable_tested": "hook_type",
+    #   "group_a": "获得感", "group_b": "损失规避"}]
+    loaded_skills: list[str] = field(default_factory=list)
+    # 已加载的经验 Skill 文本（来自历史投放验证的稳定经验）
 
     # ═══════════════════════════════════════════════════
     #  与 BI/CP 共用的文档共享字段

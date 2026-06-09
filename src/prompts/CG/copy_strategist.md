@@ -18,10 +18,13 @@
 - **关系温度**：`{{ relationship_temperature }}`（cold / warm / hot / rm_known）
 - **隐私边界**：`{{ privacy_boundary }}`（strict / standard / relaxed）
 - **当前日期**：`{{ current_date }}`
+- **是否启用 AB 实验**：`{{ ab_test }}`（True / False）
+- **历史 AB 实验结论**：`{{ historical_ab_summary }}`（运营人员填写的近期 AB 数据，按客群×渠道分组，自然语言格式；为空则无历史数据）
+- **经验库注入**：`{{ skill_injection }}`（来自历史投放验证沉淀的稳定经验 Skill，为空则无经验）
 
 # 策略规划流程
 
-严格按以下 9 个步骤执行，每一步输出对应字段。
+严格按以下 10 个步骤执行，每一步输出对应字段。
 
 ## Step 1：权益优先级排序（普世版）
 
@@ -177,6 +180,37 @@
 
 输出：`channel_orchestration_notes`
 
+## Step 10：AB 实验规划（当 ab_test=True 时执行）
+
+**前提**：仅当 `{{ ab_test }}` 为 True 时执行此步骤。若为 False，输出空 `ab_plans: []`。
+
+### 审查历史效果参考
+
+审查 `{{ historical_ab_summary }}` 中的历史 AB 实验结论：
+
+### 规划逻辑
+
+对每个 (客群, 渠道) 组合：
+
+| 场景 | 规划策略 |
+|:---|:---|
+| 有明确胜出变量 | 沿用胜出策略作为 A 组（已体现在 Step 1-9 输出中），在**其他维度**设计 B 组（探索新变量） |
+| 无历史数据 | 选择最有探索价值的变量设计首次 AB（通常从钩子类型或 CTA 措辞开始） |
+| 历史数据矛盾 | 设计验证性实验 |
+
+### 注意事项
+
+- A 组策略已体现在 Step 1-9 的输出中，B 组差异仅在 `ab_plans` 中描述
+- Copy Writer 生成 B 组变体时，会根据 `ab_plans` 覆盖对应字段
+- 每条 AB 方案只变一个变量（控制变量原则）
+
+输出：`ab_plans[]`，每条包含：
+- `persona_name`：客群名称
+- `channel_name`：渠道名称
+- `variable_tested`：实验变量（如 hook_type / cta_style / tone）
+- `group_a`：A 组取值（即当前策略）
+- `group_b`：B 组取值（待测试的替代策略）
+
 # 输出格式
 
 以 JSON 格式输出，符合 CopyStrategy 数据模型：
@@ -232,7 +266,16 @@
       "delivery_recommendation": "send/soft_send/service_first/app_passive/no_send"
     }
   ],
-  "channel_orchestration_notes": "渠道协同策略说明"
+  "channel_orchestration_notes": "渠道协同策略说明",
+  "ab_plans": [
+    {
+      "persona_name": "客群名",
+      "channel_name": "渠道名",
+      "variable_tested": "实验变量（如 hook_type）",
+      "group_a": "A 组取值",
+      "group_b": "B 组取值"
+    }
+  ]
 }
 </json>
 ```

@@ -92,6 +92,7 @@ def get_system_prompt_template(
     variants), applies variables from the agent state and Configuration object, and
     returns the fully rendered system prompt string.
     Args:
+        report_style: bi | cp | cg
         prompt_name: Name of the prompt template to load (without .md extension).
         state: Current agent state containing variables available to the template.
         configurable: Optional Configuration object providing additional template variables.
