@@ -21,6 +21,7 @@ from src.cg.parsers import (
     parse_taste_score,
 )
 from src.cg.types import (
+    AudienceReaction,
     AuditReport,
     CGState,
     ChannelCopy,
@@ -28,11 +29,16 @@ from src.cg.types import (
     MasterCopy,
     PersonaChannelStyleCard,
     PersonaStrategy,
+    TasteScore,
 )
 from src.cg.utils import (
     check_consistency,
     extract_citations_from_tool_cache,
 )
+
+# 注：ChannelSpec / PersonaChannelStyleCard / PersonaStrategy
+#     在内部函数签名和 model_validate 中使用，提供强类型校验。
+#     check_consistency 在 _adapt_one_channel 后调用。
 from src.config.agents import AGENT_LLM_MAP
 from src.config.configuration import Configuration
 from src.graph.nodes import (
@@ -290,7 +296,14 @@ async def copy_writer_node(state: CGState, config: RunnableConfig) -> dict:
 
     copy_structure = copy_strategy.get("copy_structure", "")
     hooks_library = copy_strategy.get("hooks_library", {})
-    persona_strategies: list[dict] = copy_strategy.get("persona_strategies", [])
+    persona_strategies_raw: list[dict] = copy_strategy.get("persona_strategies", [])
+    # 将 dict 转换为 PersonaStrategy 以获得强类型校验
+    persona_strategies: list[PersonaStrategy] = []
+    for ps_raw in persona_strategies_raw:
+        try:
+            persona_strategies.append(PersonaStrategy.model_validate(ps_raw))
+        except Exception:
+            persona_strategies.append(PersonaStrategy(persona_name=ps_raw.get("persona_name", "")))
 
     master_copies: list[dict] = []
     llm = _get_cg_llm("cg_copy_writer")
@@ -304,12 +317,14 @@ async def copy_writer_node(state: CGState, config: RunnableConfig) -> dict:
                 "hooks_library": hooks_library,
             }
         else:
-            creative_strategy = next(
-                (p for p in persona_strategies if p.get("persona_name") == variant_type),
-                {"persona_name": variant_type, "hooks_library": hooks_library},
+            matched_ps = next(
+                (p for p in persona_strategies if p.persona_name == variant_type),
+                None,
             )
-            # 注入钩子库
-            creative_strategy = {**creative_strategy, "hooks_library": hooks_library}
+            if matched_ps:
+                creative_strategy = {**matched_ps.model_dump(), "hooks_library": hooks_library}
+            else:
+                creative_strategy = {"persona_name": variant_type, "hooks_library": hooks_library}
 
         sub_state = {
             **state,
@@ -501,18 +516,23 @@ async def _adapt_one_channel(
     state: CGState,
     configurable: Configuration,
     master: MasterCopy,
-    channel_spec: dict,
+    channel_spec: ChannelSpec | dict,
     compliance_rule_set: dict,
 ) -> ChannelCopy:
-    """步骤 1：渠道适配（Channel Adapter）。"""
+    """步骤 1：渠道适配（Channel Adapter）。
+
+    适配完成后自动调用 check_consistency 校验母版与渠道版一致性，
+    校验问题追加到 compression_notes 字段。
+    """
+    spec_dict = channel_spec.model_dump() if isinstance(channel_spec, ChannelSpec) else channel_spec
     l2_rules = compliance_rule_set.get("l2_rules", [])
-    channel_name = channel_spec.get("channel_name", "")
+    channel_name = spec_dict.get("channel_name", "")
     channel_rules = compliance_rule_set.get("channel_rules", {}).get(channel_name, [])
 
     sub_state = {
         **state,
         "master_copy": _safe_json_dumps(master.model_dump()),
-        "channel_spec": _safe_json_dumps(channel_spec),
+        "channel_spec": _safe_json_dumps(spec_dict),
         "l2_rules": _safe_json_dumps(l2_rules),
         "channel_rules": json.dumps(channel_rules, ensure_ascii=False),
         "current_date": _current_date(),
@@ -524,7 +544,7 @@ async def _adapt_one_channel(
         resp = await llm.ainvoke(
             apply_prompt_template("CG/channel_adapter", sub_state, configurable)
         )
-        return parse_channel_copy(
+        channel_copy = parse_channel_copy(
             str(resp.content or ""),
             variant_type=master.variant_type,
             channel_name=channel_name,
@@ -537,6 +557,20 @@ async def _adapt_one_channel(
             copy_text=f"[渠道适配失败] {e}",
             char_count=0,
         )
+
+    # 一致性校验：核心数字/条件/产品名称与母版一致
+    consistency_issues = check_consistency(master, channel_copy)
+    if consistency_issues:
+        notes = channel_copy.compression_notes or ""
+        notes += " | 一致性问题: " + "; ".join(consistency_issues)
+        channel_copy = channel_copy.model_copy(update={"compression_notes": notes})
+        logger.warning(
+            "渠道适配一致性校验发现 %d 个问题 (channel=%s, variant=%s): %s",
+            len(consistency_issues), channel_name, master.variant_type,
+            "; ".join(consistency_issues),
+        )
+
+    return channel_copy
 
 
 async def _audit_one_copy(
@@ -627,19 +661,18 @@ async def _taste_check(
     state: CGState,
     configurable: Configuration,
     channel_copy: ChannelCopy,
-    style_card: dict,
-):
+    style_card: PersonaChannelStyleCard | dict,
+) -> TasteScore:
     """步骤 4：品味筛选（Taste Guardian）。"""
-    from src.cg.types import TasteScore
+    card = style_card.model_dump() if isinstance(style_card, PersonaChannelStyleCard) else style_card
 
-    persona_name = style_card.get("persona_name", channel_copy.variant_type)
-    taste_profile = style_card.get("taste_profile", "")
-    forbidden_expressions = style_card.get("forbidden_phrases", [])
-    positive_examples = style_card.get("example_good", [])
-    negative_examples = style_card.get("example_bad", [])
-    familiar_register = style_card.get("familiar_register", "")
-    max_hooks = style_card.get("max_hooks", 2)
-    cta_style = style_card.get("cta_style", "")
+    taste_profile = card.get("taste_profile", "")
+    forbidden_expressions = card.get("forbidden_phrases", [])
+    positive_examples = card.get("example_good", [])
+    negative_examples = card.get("example_bad", [])
+    familiar_register = card.get("familiar_register", "")
+    max_hooks = card.get("max_hooks", 2)
+    cta_style = card.get("cta_style", "")
 
     sub_state = {
         **state,
@@ -673,12 +706,11 @@ async def _simulate_audience(
     configurable: Configuration,
     channel_copy: ChannelCopy,
     variant_type: str,
-    style_card: dict,
-):
+    style_card: PersonaChannelStyleCard | dict,
+) -> AudienceReaction:
     """步骤 6：模拟受众（Simulated Audience）。"""
-    from src.cg.types import AudienceReaction
-
-    persona_profile = style_card or {"persona_name": variant_type}
+    card = style_card.model_dump() if isinstance(style_card, PersonaChannelStyleCard) else style_card
+    persona_profile = card if card else {"persona_name": variant_type}
     channel_context_map = {
         "企业微信": "企微私聊",
         "全民生活APP": "APP 详情页",
