@@ -39,39 +39,27 @@ from src.config.report_style import ReportStyle
 from src.config.tools import SELECTED_RAG_PROVIDER
 from src.citations import merge_citations
 from src.graph.builder import build_graph_with_memory
+from src.cg.builder import build_cg_graph_with_memory
 from src.graph.checkpoint import chat_stream_message
 from src.graph.utils import (
     build_clarified_topic_from_history,
     reconstruct_clarification_history,
 )
 from src.llms.llm import get_configured_llm_models
-from src.podcast.graph.builder import build_graph as build_podcast_graph
-from src.ppt.graph.builder import build_graph as build_ppt_graph
-from src.prompt_enhancer.graph.builder import build_graph as build_prompt_enhancer_graph
-from src.prose.graph.builder import build_graph as build_prose_graph
-from src.eval import ReportEvaluator
 from src.rag.builder import build_retriever
 from src.rag.milvus import load_examples as load_milvus_examples
 from src.rag.qdrant import load_examples as load_qdrant_examples
 from src.rag.retriever import Resource
 from src.server.chat_request import (
-    ChatRequest,
-    EnhancePromptRequest,
-    GeneratePodcastRequest,
-    GeneratePPTRequest,
-    GenerateProseRequest,
-    TTSRequest,
+    CGRequest,
+    ChatRequest
 )
-from src.server.eval_request import EvaluateReportRequest, EvaluateReportResponse
 from src.server.config_request import ConfigResponse
-from src.server.mcp_request import MCPServerMetadataRequest, MCPServerMetadataResponse
-from src.server.mcp_utils import load_mcp_tools
 from src.server.rag_request import (
     RAGConfigResponse,
     RAGResourceRequest,
     RAGResourcesResponse,
 )
-from src.tools import VolcengineTTS
 from src.utils.json_utils import sanitize_args
 from src.utils.log_sanitizer import (
     sanitize_agent_name,
@@ -242,22 +230,11 @@ load_qdrant_examples()
 
 in_memory_store = InMemoryStore()
 graph = build_graph_with_memory()
+cg_graph = build_cg_graph_with_memory()
 
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest):
-    # Check if MCP server configuration is enabled
-    mcp_enabled = get_bool_env("ENABLE_MCP_SERVER_CONFIGURATION", False)
-
-    logger.debug(f"get the request locale : {request.locale}")
-
-    # Validate MCP settings if provided
-    if request.mcp_settings and not mcp_enabled:
-        raise HTTPException(
-            status_code=403,
-            detail="MCP server configuration is disabled. Set ENABLE_MCP_SERVER_CONFIGURATION=true to enable MCP features.",
-        )
-
     thread_id = request.thread_id
     if thread_id == "__default__":
         thread_id = str(uuid4())
@@ -274,7 +251,7 @@ async def chat_stream(request: ChatRequest):
             request.max_search_results,
             request.auto_accepted_plan,
             request.interrupt_feedback,
-            request.mcp_settings if mcp_enabled else {},
+            {},
             request.enable_background_investigation,
             request.enable_web_search,
             request.report_style,
@@ -943,6 +920,7 @@ async def _astream_workflow_generator(
             graph, workflow_input, workflow_config, thread_id
         ):
             yield event
+
         logger.debug(f"[{safe_thread_id}] Graph event streaming completed")
 
 
@@ -968,243 +946,106 @@ def _make_event(event_type: str, data: dict[str, any]):
         return f"event: error\ndata: {error_data}\n\n"
 
 
-@app.post("/api/tts")
-async def text_to_speech(request: TTSRequest):
-    """Convert text to speech using volcengine TTS API."""
-    app_id = get_str_env("VOLCENGINE_TTS_APPID", "")
-    if not app_id:
-        raise HTTPException(status_code=400, detail="VOLCENGINE_TTS_APPID is not set")
-    access_token = get_str_env("VOLCENGINE_TTS_ACCESS_TOKEN", "")
-    if not access_token:
-        raise HTTPException(
-            status_code=400, detail="VOLCENGINE_TTS_ACCESS_TOKEN is not set"
-        )
+async def _astream_cg_generator(request: CGRequest, thread_id: str):
+    """CG 合规营销文案生成流水线 SSE 流式输出。"""
+    safe_thread_id = sanitize_thread_id(thread_id)
+    logger.info(
+        f"[{safe_thread_id}] CG stream starting: "
+        f"product={request.product_name}, type={request.product_type}, "
+        f"channels={request.channels}, personas={request.personas}"
+    )
 
-    try:
-        cluster = get_str_env("VOLCENGINE_TTS_CLUSTER", "volcano_tts")
-        voice_type = get_str_env("VOLCENGINE_TTS_VOICE_TYPE", "BV700_V2_streaming")
+    cg_input = {
+        "product_name": request.product_name,
+        "product_type": request.product_type,
+        "campaign_name": request.campaign_name,
+        "channels": request.channels,
+        "personas": request.personas,
+        "scene_empathy": request.scene_empathy,
+        "relationship_temperature": request.relationship_temperature,
+        "privacy_boundary": request.privacy_boundary,
+    }
 
-        tts_client = VolcengineTTS(
-            appid=app_id,
-            access_token=access_token,
-            cluster=cluster,
-            voice_type=voice_type,
-        )
-        # Call the TTS API
-        result = tts_client.text_to_speech(
-            text=request.text[:1024],
-            encoding=request.encoding,
-            speed_ratio=request.speed_ratio,
-            volume_ratio=request.volume_ratio,
-            pitch_ratio=request.pitch_ratio,
-            text_type=request.text_type,
-            with_frontend=request.with_frontend,
-            frontend_type=request.frontend_type,
-        )
+    workflow_input = {
+        "cg_input": cg_input,
+        "locale": request.locale,
+        "messages": [],
+    }
 
-        if not result["success"]:
-            raise HTTPException(status_code=500, detail=str(result["error"]))
+    workflow_config = {
+        "thread_id": thread_id,
+        "resources": request.resources or [],
+        "recursion_limit": get_recursion_limit(),
+    }
 
-        # Decode the base64 audio data
-        audio_data = base64.b64decode(result["audio_data"])
+    checkpoint_saver = get_bool_env("LANGGRAPH_CHECKPOINT_SAVER", False)
+    checkpoint_url = get_str_env("LANGGRAPH_CHECKPOINT_DB_URL", "")
 
-        # Return the audio file
-        return Response(
-            content=audio_data,
-            media_type=f"audio/{request.encoding}",
-            headers={
-                "Content-Disposition": (
-                    f"attachment; filename=tts_output.{request.encoding}"
-                )
-            },
-        )
+    logger.debug(
+        f"[{safe_thread_id}] Checkpoint configuration: "
+        f"saver_enabled={checkpoint_saver}, "
+        f"url_configured={bool(checkpoint_url)}"
+    )
 
-    except Exception as e:
-        logger.exception(f"Error in TTS endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_DETAIL)
-
-
-@app.post("/api/podcast/generate")
-async def generate_podcast(request: GeneratePodcastRequest):
-    try:
-        report_content = request.content
-        print(report_content)
-        workflow = build_podcast_graph()
-        final_state = workflow.invoke({"input": report_content})
-        audio_bytes = final_state["output"]
-        return Response(content=audio_bytes, media_type="audio/mp3")
-    except Exception as e:
-        logger.exception(f"Error occurred during podcast generation: {str(e)}")
-        raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_DETAIL)
-
-
-@app.post("/api/ppt/generate")
-async def generate_ppt(request: GeneratePPTRequest):
-    try:
-        report_content = request.content
-        print(report_content)
-        workflow = build_ppt_graph()
-        final_state = workflow.invoke({"input": report_content, "locale": request.locale})
-        generated_file_path = final_state["generated_file_path"]
-        with open(generated_file_path, "rb") as f:
-            ppt_bytes = f.read()
-        return Response(
-            content=ppt_bytes,
-            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        )
-    except Exception as e:
-        logger.exception(f"Error occurred during ppt generation: {str(e)}")
-        raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_DETAIL)
-
-
-@app.post("/api/prose/generate")
-async def generate_prose(request: GenerateProseRequest):
-    try:
-        sanitized_prompt = request.prompt.replace("\r\n", "").replace("\n", "")
-        logger.info(f"Generating prose for prompt: {sanitized_prompt}")
-        workflow = build_prose_graph()
-        events = workflow.astream(
-            {
-                "content": request.prompt,
-                "option": request.option,
-                "command": request.command,
-            },
-            stream_mode="messages",
-            subgraphs=True,
-        )
-        return StreamingResponse(
-            (f"data: {event[0].content}\n\n" async for _, event in events),
-            media_type="text/event-stream",
-        )
-    except Exception as e:
-        logger.exception(f"Error occurred during prose generation: {str(e)}")
-        raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_DETAIL)
-
-
-@app.post("/api/report/evaluate", response_model=EvaluateReportResponse)
-async def evaluate_report(request: EvaluateReportRequest):
-    """Evaluate report quality using automated metrics and optionally LLM-as-Judge."""
-    try:
-        evaluator = ReportEvaluator(use_llm=request.use_llm)
-
-        if request.use_llm:
-            result = await evaluator.evaluate(
-                request.content, request.query, request.report_style or "default"
-            )
-            return EvaluateReportResponse(
-                metrics=result.metrics.to_dict(),
-                score=result.final_score,
-                grade=result.grade,
-                llm_evaluation=result.llm_evaluation.to_dict()
-                if result.llm_evaluation
-                else None,
-                summary=result.summary,
-            )
-        else:
-            result = evaluator.evaluate_metrics_only(
-                request.content, request.report_style or "default"
-            )
-            return EvaluateReportResponse(
-                metrics=result["metrics"],
-                score=result["score"],
-                grade=result["grade"],
-            )
-    except Exception as e:
-        logger.exception(f"Error occurred during report evaluation: {str(e)}")
-        raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_DETAIL)
-
-
-@app.post("/api/prompt/enhance")
-async def enhance_prompt(request: EnhancePromptRequest):
-    try:
-        sanitized_prompt = request.prompt.replace("\r\n", "").replace("\n", "")
-        logger.info(f"Enhancing prompt: {sanitized_prompt}")
-
-        # Convert string report_style to ReportStyle enum
-        report_style = None
-        if request.report_style:
-            try:
-                # Handle both uppercase and lowercase input
-                style_mapping = {
-                    "BANK_BUSINESS_ANALYSIS": ReportStyle.BANK_BUSINESS_ANALYSIS,
-                    "CUSTOMER_SERVICE_SCRIPT": ReportStyle.CUSTOMER_SERVICE_SCRIPT,
-                    # "ACADEMIC": ReportStyle.ACADEMIC,
-                    # "POPULAR_SCIENCE": ReportStyle.POPULAR_SCIENCE,
-                    # "NEWS": ReportStyle.NEWS,
-                    # "SOCIAL_MEDIA": ReportStyle.SOCIAL_MEDIA,
-                    # "STRATEGIC_INVESTMENT": ReportStyle.STRATEGIC_INVESTMENT,
-                }
-                report_style = style_mapping.get(
-                    request.report_style.upper(), ReportStyle.BANK_BUSINESS_ANALYSIS
-                )
-            except Exception:
-                # If invalid style, default to BANK_BUSINESS_ANALYSIS
-                report_style = ReportStyle.BANK_BUSINESS_ANALYSIS
-        else:
-            report_style = ReportStyle.BANK_BUSINESS_ANALYSIS
-
-        workflow = build_prompt_enhancer_graph()
-        final_state = workflow.invoke(
-            {
-                "prompt": request.prompt,
-                "context": request.context,
-                "report_style": report_style,
+    if checkpoint_saver and checkpoint_url != "":
+        if checkpoint_url.startswith("postgresql://") and _pg_checkpointer:
+            cg_graph.checkpointer = _pg_checkpointer
+            cg_graph.store = in_memory_store
+        elif checkpoint_url.startswith("postgresql://"):
+            connection_kwargs = {
+                "autocommit": True,
+                "row_factory": "dict_row",
+                "prepare_threshold": 0,
             }
-        )
-        return {"result": final_state["output"]}
-    except Exception as e:
-        logger.exception(f"Error occurred during prompt enhancement: {str(e)}")
-        raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_DETAIL)
+            async with AsyncConnectionPool(
+                checkpoint_url, kwargs=connection_kwargs
+            ) as conn:
+                checkpointer = AsyncPostgresSaver(conn)
+                await checkpointer.setup()
+                cg_graph.checkpointer = checkpointer
+                cg_graph.store = in_memory_store
+                async for event in _stream_graph_events(
+                    cg_graph, workflow_input, workflow_config, thread_id
+                ):
+                    yield event
+                return
+        elif checkpoint_url.startswith("mongodb://") and _mongo_checkpointer:
+            cg_graph.checkpointer = _mongo_checkpointer
+            cg_graph.store = in_memory_store
+        elif checkpoint_url.startswith("mongodb://"):
+            async with AsyncMongoDBSaver.from_conn_string(
+                checkpoint_url
+            ) as checkpointer:
+                cg_graph.checkpointer = checkpointer
+                cg_graph.store = in_memory_store
+                async for event in _stream_graph_events(
+                    cg_graph, workflow_input, workflow_config, thread_id
+                ):
+                    yield event
+                return
+
+    async for event in _stream_graph_events(
+        cg_graph, workflow_input, workflow_config, thread_id
+    ):
+        yield event
+
+    logger.debug(f"[{safe_thread_id}] Graph event streaming completed")
 
 
-@app.post("/api/mcp/server/metadata", response_model=MCPServerMetadataResponse)
-async def mcp_server_metadata(request: MCPServerMetadataRequest):
-    """Get information about an MCP server."""
-    # Check if MCP server configuration is enabled
-    if not get_bool_env("ENABLE_MCP_SERVER_CONFIGURATION", False):
-        raise HTTPException(
-            status_code=403,
-            detail="MCP server configuration is disabled. Set ENABLE_MCP_SERVER_CONFIGURATION=true to enable MCP features.",
-        )
+@app.post("/api/cg/stream")
+async def cg_stream(request: CGRequest):
+    """CG 合规营销文案生成流式端点。
 
-    try:
-        # Set default timeout for this endpoint (configurable via env)
-        timeout = get_int_env("MCP_DEFAULT_TIMEOUT_SECONDS", 60)
+    流水线: fact_miner ‖ rule_miner → copy_strategist → copy_writer → adapt_audit_assemble
+    """
+    thread_id = request.thread_id
+    if thread_id == "__default__":
+        thread_id = str(uuid4())
 
-        # Use custom timeout from request if provided
-        if request.timeout_seconds is not None:
-            timeout = request.timeout_seconds
-
-        # Get sse_read_timeout from request if provided
-        sse_read_timeout = request.sse_read_timeout
-
-        # Load tools from the MCP server using the utility function
-        tools = await load_mcp_tools(
-            server_type=request.transport,
-            command=request.command,
-            args=request.args,
-            url=request.url,
-            env=request.env,
-            headers=request.headers,
-            timeout_seconds=timeout,
-            sse_read_timeout=sse_read_timeout,
-        )
-
-        # Create the response with tools
-        response = MCPServerMetadataResponse(
-            transport=request.transport,
-            command=request.command,
-            args=request.args,
-            url=request.url,
-            env=request.env,
-            headers=request.headers,
-            tools=tools,
-        )
-
-        return response
-    except Exception as e:
-        logger.exception(f"Error in MCP server metadata endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=INTERNAL_SERVER_ERROR_DETAIL)
+    return StreamingResponse(
+        _astream_cg_generator(request, thread_id),
+        media_type="text/event-stream",
+    )
 
 
 @app.get("/api/rag/config", response_model=RAGConfigResponse)

@@ -123,39 +123,21 @@ class ChatRequest(BaseModel):
     )
 
 
-class TTSRequest(BaseModel):
-    text: str = Field(..., description="The text to convert to speech")
-    voice_type: Optional[str] = Field(
-        "BV700_V2_streaming", description="The voice type to use"
+class CGRequest(BaseModel):
+    """CG 合规营销文案生成请求"""
+    thread_id: Optional[str] = Field(
+        "__default__", description="A specific conversation identifier"
     )
-    encoding: Optional[str] = Field("mp3", description="The audio encoding format")
-    speed_ratio: Optional[float] = Field(1.0, description="Speech speed ratio")
-    volume_ratio: Optional[float] = Field(1.0, description="Speech volume ratio")
-    pitch_ratio: Optional[float] = Field(1.0, description="Speech pitch ratio")
-    text_type: Optional[str] = Field("plain", description="Text type (plain or ssml)")
-    with_frontend: Optional[int] = Field(
-        1, description="Whether to use frontend processing"
-    )
-    frontend_type: Optional[str] = Field("unitTson", description="Frontend type")
-
-
-class GeneratePodcastRequest(BaseModel):
-    content: str = Field(..., description="The content of the podcast")
-
-
-class GeneratePPTRequest(BaseModel):
-    content: str = Field(..., description="The content of the ppt")
-    locale: str = Field(
-        "en-US", description="Language locale for the conversation (e.g., en-US, zh-CN)"
-    )
-
-
-class GenerateProseRequest(BaseModel):
-    prompt: str = Field(..., description="The content of the prose")
-    option: str = Field(..., description="The option of the prose writer")
-    command: Optional[str] = Field(
-        "", description="The user custom command of the prose writer"
-    )
+    product_name: str = Field(..., description="产品名称")
+    product_type: str = Field(..., description="产品类型，如联名信用卡、分期产品")
+    campaign_name: str = Field(default="", description="营销活动名称（如有）")
+    channels: list[str] = Field(default_factory=list, description="渠道列表，如企业微信、全民生活APP、短信")
+    personas: list[str] = Field(default_factory=list, description="客群列表，如山姆会员/家庭消费群体")
+    scene_empathy: bool = Field(default=True, description="是否启用场景化共情")
+    relationship_temperature: str = Field(default="warm", description="关系温度: cold/warm/hot/rm_known")
+    privacy_boundary: str = Field(default="standard", description="隐私边界: strict/standard/relaxed")
+    locale: str = Field(default="zh_CN", description="语言 locale")
+    resources: Optional[List[Resource]] = Field(default=None, description="RAG 资源列表")
 
 
 class EnhancePromptRequest(BaseModel):
