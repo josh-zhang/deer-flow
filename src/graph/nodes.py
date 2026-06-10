@@ -34,6 +34,11 @@ from src.tools import crawl_tool, get_retriever_tool
 from src.utils.context_manager import ContextManager
 from src.utils.json_utils import repair_json_output, sanitize_tool_response
 
+from .ontology import (
+    extract_ontology_mapping,
+    render_planner_guardrail,
+    render_skeleton_for_mapper,
+)
 from .types import State
 from .utils import (
     build_clarified_topic_from_history,
@@ -393,29 +398,70 @@ async def _handle_recursion_limit_fallback(
     return result_messages
 
 
-def background_investigation_node(state: State, config: RunnableConfig) -> dict:
-    logger.info("background_investigator running")
+async def background_investigation_node(state: State, config: RunnableConfig) -> dict:
+    """Ontology Mapper（P1 改造，2026-06-10）。
+
+    原 Background Investigator 的"泛读 KB → 自由文本全景概要"被替换为
+    "本体映射"：将用户问题映射到《信用卡面客知识本体》的实体类与关系边，
+    输出 <ontology_mapping> XML（<300 token），由 Planner 做约束注入。
+
+    保留一次轻量检索仅用于 KB 准确名称确认（不再作为概要素材）。
+    降级路径：LLM 映射失败或输出不含合法 XML 块时，回退为旧版行为
+    （原样下发检索 payload），保证流水线不因本体层故障中断。
+    """
+    logger.info("ontology_mapper (background_investigator) running")
+    configurable = Configuration.from_runnable_config(config)
     q = state.get("clarified_research_topic") or state.get("research_topic", "")
-    retriever_tool = get_retriever_tool(state.get("resources", []))
-    if not retriever_tool or not q:
+    if not q:
         return {
             "background_investigation_results": json.dumps([], ensure_ascii=False),
             **preserve_state_meta_fields(state),
         }
 
+    # ── 轻量检索（仅供 Mapper 确认 KB 准确名称，失败不阻断）──
+    kb_snippets = ""
+    retriever_tool = get_retriever_tool(state.get("resources", []))
+    if retriever_tool:
+        try:
+            result = retriever_tool.invoke({"keywords": q})
+            kb_snippets = result if isinstance(result, str) else json.dumps(
+                result, ensure_ascii=False
+            )
+        except Exception as e:
+            logger.warning("ontology_mapper kb probe failed: %s", e)
+
+    # ── 本体映射 LLM 调用 ──
+    human = f"### 用户问题\n{q}\n"
+    if kb_snippets:
+        human += f"\n### 知识库检索片段（仅用于确认 KB 准确名称）\n{kb_snippets[:4000]}\n"
+    sub = {
+        **state,
+        "ontology_skeleton": render_skeleton_for_mapper(),
+        "messages": [HumanMessage(content=human)],
+    }
     try:
-        # local_search_tool 入参 schema: {"keywords": "..."}
-        result = retriever_tool.invoke({"keywords": q})
-        if isinstance(result, str):
-            payload = [{"query": q, "summary": result}]
-        else:
-            payload = result
+        llm = get_llm_by_type(AGENT_LLM_MAP.get("ontology_mapper", "basic"))
+        content = str(
+            (await llm.ainvoke(apply_prompt_template("ontology_mapper", sub, configurable))).content
+            or ""
+        )
+        mapping = extract_ontology_mapping(content)
     except Exception as e:
-        logger.warning("background retriever failed: %s", e)
-        payload = [{"query": q, "error": str(e)}]
+        logger.warning("ontology_mapper llm failed: %s", e)
+        mapping = ""
+
+    if mapping:
+        payload_str = mapping
+    else:
+        # 降级：回退旧版行为，下发原始检索 payload
+        logger.warning("ontology_mapper: no valid <ontology_mapping>, fallback to raw KB payload")
+        payload_str = json.dumps(
+            [{"query": q, "summary": kb_snippets}] if kb_snippets else [],
+            ensure_ascii=False,
+        )
 
     return {
-        "background_investigation_results": json.dumps(payload, ensure_ascii=False),
+        "background_investigation_results": payload_str,
         **preserve_state_meta_fields(state),
     }
 
@@ -444,12 +490,29 @@ def planner_node(state: State, config: RunnableConfig) -> Command:
         messages = apply_prompt_template("planner", planner_state, configurable)
 
     if state.get("enable_background_investigation") and state.get("background_investigation_results"):
-        messages += [
-            {
-                "role": "user",
-                "content": "背景调查参考：\n" + str(state["background_investigation_results"]),
-            }
-        ]
+        bg_results = str(state["background_investigation_results"])
+        # P1（2026-06-10）：上游为 Ontology Mapper 时注入本体约束护栏（Constraint Injection）；
+        # 上游降级输出原始检索 payload 时回退旧版"背景调查参考"格式。
+        guardrail = render_planner_guardrail(bg_results)
+        if guardrail:
+            messages += [
+                {
+                    "role": "user",
+                    "content": (
+                        "## 本体映射结果（Ontology Mapping）\n"
+                        + extract_ontology_mapping(bg_results)
+                        + "\n\n"
+                        + guardrail
+                    ),
+                }
+            ]
+        else:
+            messages += [
+                {
+                    "role": "user",
+                    "content": "背景调查参考：\n" + bg_results,
+                }
+            ]
     if state.get("replanning_reason"):
         messages += [
             {
@@ -1081,7 +1144,8 @@ Unified data flow:
     → Searcher node end: format cache → Curator input + chunk_maps for State
 """
 
-from __future__ import annotations
+# NOTE(P1 2026-06-10): 此处原有重复的 `from __future__ import annotations`
+# （文档示例代码粘贴遗留），导致整个模块 SyntaxError 无法 import，已移除。
 
 import json
 import logging
