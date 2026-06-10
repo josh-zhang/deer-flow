@@ -159,6 +159,144 @@ EDGES: dict[str, list[dict]] = {
 
 # ── 渲染：Mapper 骨架（类 + 锚点词 + 边拓扑，不含约束全文）─────────
 
+# ── P3 辅助：12 类要素 ↔ 16 实体类映射（CP Analyzer 用）─────────
+
+ELEMENT_CLASS_MAP: dict[str, list[str]] = {
+    "1-产品信息":  ["Product_Card", "Card_Tier", "Audience"],
+    "2-费率信息":  ["Policy_Rule"],
+    "3-活动信息":  ["Campaign", "Campaign_Period"],
+    "4-权益信息":  ["Right_Entity", "Currency_Token", "Reward_Entity"],
+    "5-营销表述":  [],  # 无直接实体类映射，靠边链组合风险查漏
+    "6-数据引用":  [],
+    "7-合规标识":  [],
+    "8-渠道信息":  ["Channel"],
+    "9-第三方信息": ["Brand_Merchant"],
+    "10-法律条款": ["Policy_Rule"],
+    "11-交互要素": [],
+    "12-材料形态": ["Channel"],
+}
+
+# ── P3 辅助：边→消保审查关注点映射（CP Analyzer 边链查漏用）─────
+
+EDGE_CP_HINTS: dict[str, str] = {
+    "has_timeline":          "参与/达标/领奖时间未分离披露 → 审查点27子项",
+    "grants_reward":         "刷卡金/还款金/立减金混淆表述 → 审查点27",
+    "partnered_with":        "活动渠道限定（仅小程序生效）未明示 → 审查点23",
+    "triggers":              "容时容差/宽限期未提示 → 审查点18/20",
+    "has_fee_rules":         "刚性年费 vs 条件豁免混淆 → 审查点18",
+    "authorizes":            "信息共享超出《信息处理合作机构》名录 → 审查点1",
+    "requires_action":       "达标条件（报名/绑卡等前置操作）未明示 → 审查点23/27",
+    "belongs_to_tier":       "卡等级与权益发配错配 → 审查点12",
+    "issued_with":           "积点/积分机制省略 → 审查点22/23",
+    "can_redeem":            "核销成本/有效期未披露 → 审查点23",
+    "redeemed_by":           "核销路径/预约限制未披露 → 审查点22/23",
+    "relates_to_installment":"分期类型混淆 → 审查点8/9",
+    "absorbs_quota_from":    "额度占用规则未明示 → 审查点19/23",
+    "costs":                 "手续费/提前结清违约金未披露 → 审查点18/20",
+    "authenticates_with":    "核身方式未说明 → 审查点6",
+    "routed_through":        "渠道限定未明示 → 审查点5/23",
+    "changes_state":         "账户异常态操作风险 → 审查点9",
+    "resolves_via":          "投诉受理渠道缺失 → 审查点25",
+}
+
+
+def render_element_class_mapping() -> str:
+    """渲染 12 类要素→16 实体类映射表（CP Analyzer 1A/1B 步骤用）。"""
+    lines = ["| 要素类型 | 对应本体实体类 |", "|:---|:---|"]
+    for etype, classes in ELEMENT_CLASS_MAP.items():
+        cls_str = ", ".join(f"`{c}`" for c in classes) if classes else "（无直接映射，靠边链查漏）"
+        lines.append(f"| {etype} | {cls_str} |")
+    return "\n".join(lines)
+
+
+def render_edge_cp_hints() -> str:
+    """渲染边→消保审查关注点提示表（CP Analyzer 1C / 2B 步骤用）。"""
+    lines = ["| 本体边 | 消保风险提示 |", "|:---|:---|"]
+    for edge, hint in EDGE_CP_HINTS.items():
+        lines.append(f"| `{edge}` | {hint} |")
+    return "\n".join(lines)
+
+
+# ── P3 辅助：Arbitrator 按边分桶 + 特指链 ───────────────────────
+
+# Card_Tier 特指链：越右越特指
+TIER_SPECIFICITY: list[str] = [
+    "全卡通用",
+    "普卡", "金卡",
+    "标准白金卡", "豪华白金卡", "精英白金卡",
+    "钻石卡", "百夫长黑金卡",
+]
+
+
+def render_arbitrator_bucketing_guide() -> str:
+    """渲染 Arbitrator 的按边分桶指引与 Card_Tier 特指链。"""
+    lines = [
+        "## 本体辅助——按边分桶与特指链",
+        "",
+        "### 矛盾候选分桶规则",
+        "只有挂在**同一条本体关系边**上的原子规则才构成矛盾候选。"
+        "每条原子规则携带的 `ontology_edge` 标签标明其所属边；"
+        "无标签或标签为\"none\"的规则归入\"通用桶\"，仅与同为通用桶的规则比对。",
+        "分桶后在桶内执行标准矛盾识别流程（第二步），不做跨桶比对。",
+        "",
+        "### Card_Tier 特指链（优先级 2 辅助判定）",
+        "当两条规则分属不同卡等级时，以下列表越右侧越特指（特指优于通用）：",
+        "",
+        " → ".join(TIER_SPECIFICITY),
+        "",
+        "例：\"白金卡规则\" 特指于 \"全卡通用规则\"；\"钻石卡规则\" 特指于 \"白金卡规则\"。"
+        "此链为 `belongs_to_tier` 边的层级体现，仲裁时不再靠模型语感判断谁特指谁。",
+    ]
+    return "\n".join(lines)
+
+
+# ── P3 辅助：CG Copy Auditor 按边对账 checklist ──────────────────
+
+CG_EDGE_AUDIT_CHECKLIST: dict[str, str] = {
+    "has_timeline":          "活动提到时间 → 必须区分参与/达标/领奖三段时间",
+    "grants_reward":         "活动提到奖励 → 严禁刷卡金/还款金/立减金混淆",
+    "partnered_with":        "涉及第三方品牌 → 必须标注渠道限定（仅小程序/仅线下等）",
+    "requires_action":       "涉及达标条件 → 必须明示前置操作（报名/绑卡等）",
+    "costs":                 "涉及分期/提前还款 → 手续费和提前结清违约金必须披露",
+    "absorbs_quota_from":    "涉及分期产品 → 额度占用规则（固定额度/独立专项）必须明示",
+    "relates_to_installment":"涉及分期 → 必须明确分期产品类型（全民乐/账单分期等），严禁混淆",
+    "has_fee_rules":         "涉及年费 → 刚性年费/条件豁免必须区分",
+    "issued_with":           "涉及积点/积分 → 发放机制/扣减标准/有效期必须说明",
+    "can_redeem":            "涉及权益核销 → 核销所需积点/积分数量和可否购买必须说明",
+    "redeemed_by":           "涉及权益使用 → 核销路径（APP/电话）和预约限制必须明确",
+    "belongs_to_tier":       "涉及卡等级 → 权益发配因 Tier 而异，严禁跨等级承诺",
+}
+
+
+def render_cg_audit_edge_checklist() -> str:
+    """渲染 CG Copy Auditor 的按边对账 checklist。"""
+    lines = [
+        "## 本体边触发检查清单（维度 1 补充）",
+        "",
+        "当文案涉及以下本体边对应的业务概念时，必须执行该检查项。"
+        "这是封闭式对账——逐边核对，不遗漏：",
+        "",
+        "| 触发条件（文案涉及的概念） | 必须检查 |",
+        "|:---|:---|",
+    ]
+    for edge, check in CG_EDGE_AUDIT_CHECKLIST.items():
+        lines.append(f"| `{edge}` | {check} |")
+    return "\n".join(lines)
+
+
+# ── P3 便捷注入：CP Analyzer 模板变量字典 ────────────────────────
+
+def get_cp_analyzer_template_vars() -> dict[str, str]:
+    """返回 CP Analyzer 提示词所需的全部本体模板变量。
+
+    CP 节点代码实现时，在 sub_state 中 `sub_state.update(get_cp_analyzer_template_vars())`
+    即可一行注入 {{ element_class_mapping }} 和 {{ edge_cp_hints }} 两个变量。
+    """
+    return {
+        "element_class_mapping": render_element_class_mapping(),
+        "edge_cp_hints": render_edge_cp_hints(),
+    }
+
 
 def render_skeleton_for_mapper() -> str:
     """渲染注入 Ontology Mapper 提示词的本体骨架。

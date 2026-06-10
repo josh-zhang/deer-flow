@@ -36,6 +36,7 @@ from src.utils.json_utils import repair_json_output, sanitize_tool_response
 
 from .ontology import (
     extract_ontology_mapping,
+    render_arbitrator_bucketing_guide,
     render_planner_guardrail,
     render_skeleton_for_mapper,
 )
@@ -974,7 +975,11 @@ async def arbitrator_node(state: State, config: RunnableConfig) -> dict:
         f"### 当前工作流类型\n{labels.get(wf, wf)}\n\n"
         f"### 关联业务原子规则清单\n{blob}\n"
     )
-    sub = {**state, "messages": [HumanMessage(content=human)]}
+    sub = {
+        **state,
+        "arbitrator_bucketing_guide": render_arbitrator_bucketing_guide(),
+        "messages": [HumanMessage(content=human)],
+    }
     llm = get_llm_by_type(AGENT_LLM_MAP.get("arbitrator", "basic"))
     out = str((await llm.ainvoke(apply_prompt_template("arbitrator", sub, configurable))).content or "")
     return {**preserve_state_meta_fields(state), "arbitration_result": out.strip()}

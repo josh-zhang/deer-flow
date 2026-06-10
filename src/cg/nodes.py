@@ -47,6 +47,7 @@ from src.graph.nodes import (
     extract_document_metadata_from_cache,
     make_tool_saver_hook,
 )
+from src.graph.ontology import render_cg_audit_edge_checklist
 from src.llms.llm import get_llm_by_type, get_llm_token_limit_by_type
 from src.prompts.template import apply_prompt_template, get_system_prompt_template
 from src.tools import crawl_tool, get_retriever_tool
@@ -660,6 +661,7 @@ async def _audit_one_copy(
         "compliance_rules": _safe_json_dumps(compliance_rule_set),
         "master_copy": _safe_json_dumps(master.model_dump()),
         "current_date": _current_date(),
+        "cg_audit_edge_checklist": render_cg_audit_edge_checklist(),
         "messages": [HumanMessage(content="请对上述渠道版文案进行五维合规审计，输出 AuditReport JSON。")],
     }
 

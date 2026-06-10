@@ -4,7 +4,7 @@
 import dataclasses
 import os
 from datetime import datetime
-from jinja2 import Environment, FileSystemLoader, TemplateNotFound, select_autoescape
+from jinja2 import Environment, FileSystemLoader, TemplateNotFound, Undefined, select_autoescape
 from langchain.agents import AgentState
 
 from src.config.configuration import Configuration
@@ -28,6 +28,7 @@ cp_env = Environment(
     autoescape=select_autoescape(),
     trim_blocks=True,
     lstrip_blocks=True,
+    undefined=Undefined,  # P3: CP 节点代码尚未实现，本体模板变量可能缺失，渲染为空而非报错
 )
 
 
