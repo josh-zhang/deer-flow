@@ -15,6 +15,8 @@ import json
 import logging
 from functools import partial
 from typing import Annotated, Any, Literal
+from collections import defaultdict
+from pydantic import BaseModel, Field
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -33,6 +35,7 @@ from src.prompts.template import apply_prompt_template, get_system_prompt_templa
 from src.tools import crawl_tool, get_retriever_tool
 from src.utils.context_manager import ContextManager
 from src.utils.json_utils import repair_json_output, sanitize_tool_response
+from src.extraction.chunk_extractor import ExtractionResult
 
 from .ontology import (
     extract_ontology_mapping,
@@ -400,69 +403,153 @@ async def _handle_recursion_limit_fallback(
 
 
 async def background_investigation_node(state: State, config: RunnableConfig) -> dict:
-    """Ontology Mapper（P1 改造，2026-06-10）。
+    """BGI / Analyzer 双模式节点（BI + CP 共享，按 pipeline_mode 路由提示词）。
 
-    原 Background Investigator 的"泛读 KB → 自由文本全景概要"被替换为
-    "本体映射"：将用户问题映射到《信用卡面客知识本体》的实体类与关系边，
-    输出 <ontology_mapping> XML（<300 token），由 Planner 做约束注入。
+    BI 模式（pipeline_mode="bi"）：
+        阶段 1 — 调用 BI/background_investigator.md（ReAct Agent + KB 探索）→ kb_panorama
+        阶段 2 — 调用 BI/ontology_mapper.md（纯 LLM 本体映射）→ background_investigation_results
 
-    保留一次轻量检索仅用于 KB 准确名称确认（不再作为概要素材）。
-    降级路径：LLM 映射失败或输出不含合法 XML 块时，回退为旧版行为
-    （原样下发检索 payload），保证流水线不因本体层故障中断。
+    CP 模式（pipeline_mode="cp"）：
+        调用 CP/analyzer.md（纯 LLM 审查范围分析）→ analyzer_output
+        不做 KB 探索和本体映射（CP 无需背景调研，Analyzer 直接分析宣传文本）
     """
-    logger.info("ontology_mapper (background_investigator) running")
+    logger.info("background_investigation_node running (mode=%s)", state.get("pipeline_mode", "bi"))
     configurable = Configuration.from_runnable_config(config)
+    mode = state.get("pipeline_mode", "bi")
+
+    if mode == "cp":
+        return await _run_cp_analyzer(state, configurable)
+    else:
+        return await _run_bi_bgi_and_mapper(state, config, configurable)
+
+
+async def _run_cp_analyzer(state: State, configurable: Configuration) -> dict:
+    """CP 模式：调用 CP/analyzer.md 分析宣传文本。"""
+    promo = state.get("promotional_text", "")
+    if not promo:
+        logger.warning("CP analyzer: no promotional_text, skipping")
+        return {
+            "analyzer_output": "",
+            "background_investigation_results": json.dumps([], ensure_ascii=False),
+            "kb_panorama": "",
+            **preserve_state_meta_fields(state),
+        }
+
+    from .ontology import get_cp_analyzer_template_vars
+
+    sub: dict = {
+        **state,
+        **get_cp_analyzer_template_vars(),
+        "messages": [HumanMessage(content=f"## 信用卡业务宣传文本\n\n{promo}")],
+    }
+    llm = get_llm_by_type(AGENT_LLM_MAP.get("cp_analyzer", "basic"))
+    try:
+        resp = await llm.ainvoke(
+            apply_prompt_template("CP/analyzer", sub, configurable)
+        )
+        analyzer_output = str(resp.content or "")
+    except Exception as e:
+        logger.exception("CP analyzer failed: %s", e)
+        analyzer_output = f"[Analyzer 执行失败: {e}]"
+
+    return {
+        "analyzer_output": analyzer_output,
+        "background_investigation_results": json.dumps([], ensure_ascii=False),
+        "kb_panorama": "",
+        **preserve_state_meta_fields(state),
+    }
+
+
+async def _run_bi_bgi_and_mapper(
+    state: State, config: RunnableConfig, configurable: Configuration
+) -> dict:
+    """BI 模式：BGI 多角度 KB 探索 + Ontology Mapper 双阶段。"""
     q = state.get("clarified_research_topic") or state.get("research_topic", "")
     if not q:
         return {
             "background_investigation_results": json.dumps([], ensure_ascii=False),
+            "kb_panorama": "",
             **preserve_state_meta_fields(state),
         }
 
-    # ── 轻量检索（仅供 Mapper 确认 KB 准确名称，失败不阻断）──
-    kb_snippets = ""
-    retriever_tool = get_retriever_tool(state.get("resources", []))
-    if retriever_tool:
+    locale = state.get("locale", "zh_CN")
+    wf = state.get("workflow_type", "A")
+
+    # ════════════════════════════════════════════════════
+    #  阶段 1：BGI 多角度 KB 探索 → kb_panorama
+    # ════════════════════════════════════════════════════
+    kb_panorama = ""
+    tools = [t for t in [get_retriever_tool(state.get("resources", [])), crawl_tool] if t]
+    if tools:
+        # BGI 输入：用户问题 + 工作流类型（Coordinator 已输出）
+        # 注意：missing_conditions 由 Planner 输出，BGI 在 Planner 之前执行，不可引用
+        bgi_user = f"## 用户问题\n{q}\n\n## 工作流类型\n{wf}\n"
+
+        llm_limit = get_llm_token_limit_by_type(
+            AGENT_LLM_MAP.get("background_investigator", "basic")
+        )
+        hook = partial(ContextManager(llm_limit, 3).compress_messages)
+        bgi_agent = create_agent(
+            "background_investigator",
+            "background_investigator",
+            tools,
+            "background_investigator",
+            hook,
+            interrupt_before_tools=configurable.interrupt_before_tools,
+            locale=locale,
+        )
         try:
-            result = retriever_tool.invoke({"keywords": q})
-            kb_snippets = result if isinstance(result, str) else json.dumps(
-                result, ensure_ascii=False
+            bgi_out = await bgi_agent.ainvoke(
+                {"messages": [HumanMessage(content=bgi_user)]},
+                config={"recursion_limit": 15},
+            )
+            bgi_msgs = bgi_out.get("messages", [])
+            bgi_last = _last_ai_message(bgi_msgs)
+            kb_panorama = sanitize_tool_response(
+                str(get_message_content(bgi_last) or "")
             )
         except Exception as e:
-            logger.warning("ontology_mapper kb probe failed: %s", e)
+            logger.warning("BGI agent failed, kb_panorama will be empty: %s", e)
 
-    # ── 本体映射 LLM 调用 ──
-    human = f"### 用户问题\n{q}\n"
-    if kb_snippets:
-        human += f"\n### 知识库检索片段（仅用于确认 KB 准确名称）\n{kb_snippets[:4000]}\n"
-    sub = {
+    # ════════════════════════════════════════════════════
+    #  阶段 2：Ontology Mapper → background_investigation_results
+    # ════════════════════════════════════════════════════
+    mapper_human = f"### 用户问题\n{q}\n"
+    if kb_panorama:
+        mapper_human += (
+            f"\n### 知识库全景概要（仅用于确认 KB 准确名称）\n{kb_panorama[:4000]}\n"
+        )
+    mapper_sub = {
         **state,
         "ontology_skeleton": render_skeleton_for_mapper(),
-        "messages": [HumanMessage(content=human)],
+        "messages": [HumanMessage(content=mapper_human)],
     }
+    mapping = ""
     try:
-        llm = get_llm_by_type(AGENT_LLM_MAP.get("ontology_mapper", "basic"))
-        content = str(
-            (await llm.ainvoke(apply_prompt_template("ontology_mapper", sub, configurable))).content
-            or ""
+        mapper_llm = get_llm_by_type(AGENT_LLM_MAP.get("ontology_mapper", "basic"))
+        mapper_content = str(
+            (await mapper_llm.ainvoke(
+                apply_prompt_template("ontology_mapper", mapper_sub, configurable)
+            )).content or ""
         )
-        mapping = extract_ontology_mapping(content)
+        mapping = extract_ontology_mapping(mapper_content)
     except Exception as e:
-        logger.warning("ontology_mapper llm failed: %s", e)
-        mapping = ""
+        logger.warning("ontology_mapper LLM failed: %s", e)
 
     if mapping:
         payload_str = mapping
     else:
-        # 降级：回退旧版行为，下发原始检索 payload
-        logger.warning("ontology_mapper: no valid <ontology_mapping>, fallback to raw KB payload")
+        logger.warning(
+            "ontology_mapper: no valid <ontology_mapping>, fallback to raw KB panorama"
+        )
         payload_str = json.dumps(
-            [{"query": q, "summary": kb_snippets}] if kb_snippets else [],
+            [{"query": q, "summary": kb_panorama}] if kb_panorama else [],
             ensure_ascii=False,
         )
 
     return {
         "background_investigation_results": payload_str,
+        "kb_panorama": kb_panorama,
         **preserve_state_meta_fields(state),
     }
 
@@ -492,8 +579,8 @@ def planner_node(state: State, config: RunnableConfig) -> Command:
 
     if state.get("enable_background_investigation") and state.get("background_investigation_results"):
         bg_results = str(state["background_investigation_results"])
-        # P1（2026-06-10）：上游为 Ontology Mapper 时注入本体约束护栏（Constraint Injection）；
-        # 上游降级输出原始检索 payload 时回退旧版"背景调查参考"格式。
+        # P1 修正（2026-06-10）：本体映射 + KB 概要双通道注入。
+        # 本体边=必查维度硬性下限；KB 概要=长尾覆盖 + KB 准确名称权威来源。
         guardrail = render_planner_guardrail(bg_results)
         if guardrail:
             messages += [
@@ -512,6 +599,23 @@ def planner_node(state: State, config: RunnableConfig) -> Command:
                 {
                     "role": "user",
                     "content": "背景调查参考：\n" + bg_results,
+                }
+            ]
+        # KB 概要独立注入（无论本体映射是否成功，只要有 KB 概要就下发）
+        kb_panorama = state.get("kb_panorama") or ""
+        if kb_panorama.strip():
+            messages += [
+                {
+                    "role": "user",
+                    "content": (
+                        "## 知识库探索概要（KB 准确名称以此为准）\n"
+                        "以下为知识库轻量检索结果，用于：\n"
+                        "1. **KB 准确名称校准**——知识库中的产品/业务准确名称以此为准"
+                        "（优先于本体映射 <kb_terms> 中的名称）\n"
+                        "2. **长尾信息参考**——本体映射覆盖核心骨架（16 类 + 20 边），"
+                        "本体 <unmapped> 之外的长尾业务信息以此为线索安排探索性检索\n\n"
+                        + kb_panorama[:6000]
+                    ),
                 }
             ]
     if state.get("replanning_reason"):
@@ -1149,21 +1253,6 @@ Unified data flow:
     → Searcher node end: format cache → Curator input + chunk_maps for State
 """
 
-# NOTE(P1 2026-06-10): 此处原有重复的 `from __future__ import annotations`
-# （文档示例代码粘贴遗留），导致整个模块 SyntaxError 无法 import，已移除。
-
-import json
-import logging
-from collections import defaultdict
-from dataclasses import dataclass, field
-
-from langchain_core.messages import ToolMessage
-from pydantic import BaseModel, Field
-
-# 从截取模块导入
-from src.extraction.chunk_extractor import ExtractionResult
-
-logger = logging.getLogger(__name__)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -7,7 +7,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from src.graph.types import State
-from src.graph.cp_nodes import (
+from src.graph.nodes import (
     analyst_node,
     arbitrator_node,
     background_investigation_node,

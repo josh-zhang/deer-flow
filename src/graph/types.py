@@ -41,7 +41,8 @@ class State(MessagesState):
     #  Background Investigation
     # ═══════════════════════════════════════════════════
     enable_background_investigation: bool = True
-    background_investigation_results: str | None = None
+    background_investigation_results: str | None = None  # 本体映射 XML 或降级时的原始检索 payload
+    kb_panorama: str | None = None  # P1 修正：KB 轻量检索概要（独立于本体映射，供 Planner 长尾参考）
     resources: Annotated[list[Resource], operator.add] = field(
         default_factory=list
     )
@@ -112,6 +113,12 @@ class State(MessagesState):
     # ═══════════════════════════════════════════════════
     auto_accepted_plan: bool = False
     goto: str = "planner"
+
+    # ═══════════════════════════════════════════════════
+    #  CP 扩展字段
+    # ═══════════════════════════════════════════════════
+    promotional_text: str = ""       # 宣传文本原文（CP 输入）
+    analyzer_output: str = ""        # Analyzer 输出（审查范围分析报告 Markdown）
 
     # ═══════════════════════════════════════════════════
     #  Document Chunk Maps — 全局累积，跨步骤合并
