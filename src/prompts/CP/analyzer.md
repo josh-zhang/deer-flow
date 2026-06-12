@@ -74,7 +74,7 @@
 
 {{ edge_topology_with_hints }}
 
-O 类要素示例：文案出现 `Reward_Entity`（最高立减666）+ `Financial_Transaction`（消费满3000），命中 `requires_action` 边 → 但文案未明示"需在全民生活APP报名" → 标记为 O 类。
+O 类要素示例：文案出现 `Campaign`（刷卡即享随机立减活动）+ `Financial_Transaction`（消费满3000），命中 `requires_action` 边（`Campaign` → `Financial_Transaction / Service_Operation`）→ 但文案未明示达标的前置操作（如"需在全民生活APP报名"）→ 标记为 O 类。
 
 **要素穷举完成后，你应当得到一份完整的要素清单，包含：显性要素（来自 1A）、缺失要素（来自 1B）、组合要素（来自 1C）、本体查漏要素（来自 1D）。**
 

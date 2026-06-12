@@ -35,7 +35,7 @@ LIFECYCLE_STAGES: list[tuple[str, str]] = [
     ("Servicing & Retention", "服务与留存期：换卡、挂失、资料修改、息费争议、销卡挽留"),
 ]
 
-# ── 16 个核心实体类（名称, 定义, 模糊匹配锚点词, 生命周期）────────
+# ── 17 个核心实体类（名称, 定义, 模糊匹配锚点词, 生命周期）────────
 
 CLASSES: list[dict] = [
     {"name": "Product_Card", "desc": "信用卡产品本身",
@@ -44,9 +44,9 @@ CLASSES: list[dict] = [
      "anchors": "普卡/金卡、标准白金卡(标白)、豪华白金卡(豪白)、钻石卡、百夫长黑金卡", "stage": "贯穿全周期"},
     {"name": "Lifecycle_Stage", "desc": "客户/卡片/账户的当前状态",
      "anchors": "未激活、睡眠户、逾期、销卡态、止付、冻结、呆账", "stage": "贯穿全周期"},
-    {"name": "Right_Entity", "desc": "持卡人长期恒定权益及高端服务",
-     "anchors": "非凡礼遇、机场/高铁贵宾厅(龙腾)、接送机、洗牙/专家挂号、高尔夫、延误险、道路救援", "stage": "Usage / Retention"},
-    {"name": "Currency_Token", "desc": "行内流转的虚拟通货/核销介质",
+    {"name": "Right_Entity", "desc": "持卡人获得的长期恒定权益及高端服务",
+     "anchors": "非凡礼遇、机场/高铁贵宾厅(龙腾)、接送机、洗牙/专家挂号、高尔夫/网球、延误险、道路救援", "stage": "Usage / Retention"},
+    {"name": "Currency_Token", "desc": "银行内部流转的虚拟通货/核销介质",
      "anchors": "积点(民生高端权益专属)、通用积分、联名方积分(如东航里程)、资质(次/点)", "stage": "Growth / Usage"},
     {"name": "Campaign", "desc": "限定期的营销活动",
      "anchors": "新户礼、首刷送、满减、随机抽奖、特惠商圈、瓜分积分、报名参与", "stage": "贯穿全周期"},
@@ -54,23 +54,23 @@ CLASSES: list[dict] = [
      "anchors": "自然月、账单月、活动达标期、活动领奖期、每周五、节假日", "stage": "贯穿全周期"},
     {"name": "Reward_Entity", "desc": "活动奖励/礼品的物理或虚拟形式",
      "anchors": "立减金、刷卡金、还款金、多倍积分、实物/行李箱、视频会员、接送机券", "stage": "贯穿全周期"},
-    {"name": "Brand_Merchant", "desc": "参与活动的外部品牌或商户",
+    {"name": "Brand_Merchant", "desc": "参与活动的外部商业品牌或商户",
      "anchors": "星巴克、海底捞、中石油、山姆会员店、京东、指定商圈", "stage": "Usage"},
     {"name": "Service_Operation", "desc": "面客服务办理与账户维护",
      "anchors": "激活、密码重置、补换卡、挂失、解除挂失/止付、改预留手机号、升降额、销户、提前结清/还款、延期还款", "stage": "Activation / Servicing"},
-    {"name": "Customer_Service", "desc": "面客服务与查询矩阵",
-     "anchors": "咨询与投诉、办卡进度查询、额度/账单/积分查询、用卡百科、用卡须知、信息处理合作机构", "stage": "贯穿全周期"},
+    {"name": "Customer_Service", "desc": "面客服务与查询矩阵（对应官网\"客户服务\"与\"常见问题\"）",
+     "anchors": "咨询与投诉、ATM查询、网点查询、办卡进度查询、开卡激活查询、额度/账单/积分查询、用卡百科、用卡须知、金融知识、信息处理合作机构", "stage": "贯穿全周期"},
     {"name": "Financial_Transaction", "desc": "资金流动、交易、还款及分期",
-     "anchors": "绑卡(第三方)、扫码支付、账单分期、现金分期、预借现金、按期还款、最低还款、溢缴款领回", "stage": "Usage / Growth"},
+     "anchors": "绑卡(第三方)、扫码支付、账单分期、现金分期、提取现金/预借现金、按期还款、最低还款、溢缴款领回", "stage": "Usage / Growth"},
     {"name": "Installment_Product", "desc": "分期信贷产品类型",
      "anchors": "账单分期、自由分期/单笔分期、全民乐分期、现金分期、汽车分期/车位分期、商场分期", "stage": "Growth"},
-    {"name": "Channel", "desc": "办卡或获取服务的自营及第三方平台",
+    {"name": "Channel", "desc": "用户办卡或获取服务触达的自营及第三方平台",
      "anchors": "全民生活APP、微信公众号、信用卡小程序、支付宝、财付通、云闪付、网点、客服热线(IVR/人工)", "stage": "贯穿全周期"},
     {"name": "Verification_Method", "desc": "实名核身与安全鉴权要素",
-     "anchors": "刷脸/人脸识别、短信验证码/OTP、交易密码、查询密码、CVV2、卡片有效期、身份证正反面、预留手机号验证、设备绑定/免密", "stage": "贯穿全周期"},
+     "anchors": "刷脸/人脸识别、短信验证码/OTP、交易密码、查询密码、CVV2安全码、卡片有效期、身份证正反面、预留手机号验证、设备绑定/免密", "stage": "贯穿全周期(核心于线上操作)"},
     {"name": "Audience", "desc": "面向的限制客群",
      "anchors": "新户、老客、受邀客户、资产达标(私行)", "stage": "贯穿全周期"},
-    {"name": "Policy_Rule", "desc": "操作背后的核心规则与红线",
+    {"name": "Policy_Rule", "desc": "支撑操作背后的核心规则与红线",
      "anchors": "年费收取规则、违约金规则、分期手续费、提前还款违约金、取现利息、宽限期/容时容差、隐私授权、催收规范、征信报送规则", "stage": "贯穿全周期"},
 ]
 
@@ -159,7 +159,7 @@ EDGES: dict[str, list[dict]] = {
 
 # ── 渲染：Mapper 骨架（类 + 锚点词 + 边拓扑，不含约束全文）─────────
 
-# ── P3 辅助：12 类要素 ↔ 16 实体类映射（CP Analyzer 用）─────────
+# ── P3 辅助：12 类要素 ↔ 17 实体类映射（CP Analyzer 用）─────────
 
 ELEMENT_CLASS_MAP: dict[str, list[str]] = {
     "1-产品信息":  ["Product_Card", "Card_Tier", "Audience"],
@@ -201,7 +201,7 @@ EDGE_CP_HINTS: dict[str, str] = {
 
 
 def render_element_class_mapping() -> str:
-    """渲染 12 类要素→16 实体类映射表（CP Analyzer 1A/1B 步骤用）。"""
+    """渲染 12 类要素→17 实体类映射表（CP Analyzer 1A/1B 步骤用）。"""
     lines = ["| 要素类型 | 对应本体实体类 |", "|:---|:---|"]
     for etype, classes in ELEMENT_CLASS_MAP.items():
         cls_str = ", ".join(f"`{c}`" for c in classes) if classes else "（无直接映射，靠边链查漏）"
@@ -416,7 +416,7 @@ def render_skeleton_for_mapper() -> str:
         lines.append(f"- **{name}**：{desc}")
 
     lines.append("")
-    lines.append("### 实体类白名单（16 个 Class，禁止超出此范围）")
+    lines.append("### 实体类白名单（17 个 Class，禁止超出此范围）")
     lines.append("| Class | 定义 | 模糊匹配锚点词 |")
     lines.append("|:---|:---|:---|")
     for c in CLASSES:
