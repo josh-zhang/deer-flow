@@ -11,7 +11,6 @@ AGENT_LLM_MAP: dict[str, LLMType] = {
     "coordinator": "basic",
     "background_investigator": "basic",
     "ontology_mapper": "basic",
-    "cp_analyzer": "basic",
     "planner": "basic",
     "researcher": "basic",
     "curator": "basic",

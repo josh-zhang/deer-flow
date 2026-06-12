@@ -33,7 +33,7 @@
 
 ## 1. 明确评估基准
 
-阅读"检索内容"，明确需要查找的行规法规依据类型。
+阅读"检索内容"，明确需要查找的行规法规依据类型。同时从步骤标题和背景中识别当前审查点涉及的核心业务概念，将其锚定到本体实体类（常见实体类：`Product_Card`、`Card_Tier`、`Campaign`、`Campaign_Period`、`Reward_Entity`、`Right_Entity`、`Currency_Token`、`Financial_Transaction`、`Installment_Product`、`Policy_Rule`、`Channel`、`Brand_Merchant`、`Service_Operation`、`Customer_Service`、`Verification_Method`、`Audience`）。
 
 ## 2. 逐条评估每个片段
 
@@ -108,6 +108,7 @@
 
 - **检索内容**：[复述"检索内容"原文]
 - **所需依据类型**：[行规法规的哪些方面]
+- **本体标的**：[当前审查点涉及的核心本体实体类名称，如 `Campaign`、`Policy_Rule`；无法判断时写"无"]
 
 ### 外部法规依据
 

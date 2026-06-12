@@ -210,10 +210,35 @@ def render_element_class_mapping() -> str:
 
 
 def render_edge_cp_hints() -> str:
-    """渲染边→消保审查关注点提示表（CP Analyzer 1C / 2B 步骤用）。"""
+    """渲染边→消保审查关注点提示表（CP Analyzer 1C / 2B 步骤用）。
+
+    ⚠️ 已被 render_edge_topology_with_hints() 取代用于 CP Analyzer 注入。
+    保留此函数供其他消费方（如未来的 CG 节点）使用。
+    """
     lines = ["| 本体边 | 消保风险提示 |", "|:---|:---|"]
     for edge, hint in EDGE_CP_HINTS.items():
         lines.append(f"| `{edge}` | {hint} |")
+    return "\n".join(lines)
+
+
+def render_edge_topology_with_hints() -> str:
+    """渲染边拓扑+消保风险提示三列表（CP Analyzer 1D 边链查漏 + 2B 反向验证用）。
+
+    合并 EDGES 的 src/dst 拓扑信息与 EDGE_CP_HINTS 的消保风险提示，
+    使模型能直接判断"边两端实体是否同时出现在文案中"。
+
+    对于有多条 entry 的边（如 routed_through），每条 entry 单独一行。
+    """
+    lines = [
+        "| 本体边 | 源实体 → 目标实体 | 消保风险提示 |",
+        "|:---|:---|:---|",
+    ]
+    for edge_name, entries in EDGES.items():
+        hint = EDGE_CP_HINTS.get(edge_name, "")
+        for entry in entries:
+            src = entry["src"]
+            dst = entry["dst"]
+            lines.append(f"| `{edge_name}` | `{src}` → `{dst}` | {hint} |")
     return "\n".join(lines)
 
 
@@ -284,17 +309,99 @@ def render_cg_audit_edge_checklist() -> str:
     return "\n".join(lines)
 
 
+# ── CP 3.2 改造：Point Assessor / Planner 本体辅助渲染 ──────────
+
+
+def render_cp_edge_constraints_for_assessor() -> str:
+    """渲染 CP Point Assessor 用的本体边约束解释参考表。
+
+    路径C（知识库未收录兜底）时，模型可引用边约束解释作为结构化依据，
+    缓解"模型裸判"风险。同时供整改建议引用边规则方向。
+    """
+    lines = [
+        "## 本体边约束解释参考（路径C补充依据 + 整改建议参考）",
+        "",
+        "当路径C（知识库未收录）触发时，优先在下表中查找当前审查点对应的边约束解释，"
+        "作为结构化兜底依据引用。撰写整改建议时，也可参考命中边的规则方向。",
+        "",
+        "| 本体边 | 源实体 → 目标实体 | 约束解释（可引用为兜底依据） |",
+        "|:---|:---|:---|",
+    ]
+    for edge_name, entries in EDGES.items():
+        for entry in entries:
+            lines.append(
+                f"| `{edge_name}` | `{entry['src']}` → `{entry['dst']}` "
+                f"| {entry['constraint']} |"
+            )
+    return "\n".join(lines)
+
+
+def render_cp_planner_edge_guide() -> str:
+    """渲染 CP Planner 用的边约束检索方向参考表。
+
+    从 EDGE_CP_HINTS 提取审查点编号，合并 EDGES 的约束解释，
+    让 Planner 的 description 可直接由边约束改写生成。
+    """
+    lines = [
+        "## 本体边约束检索方向（优先参考）",
+        "",
+        "当审查点命中以下本体边时，research 步骤的 description 应优先基于"
+        "该边的约束解释改写检索需求，减少模型转述层数。"
+        "未命中边的审查点仍使用上方静态参考表。",
+        "",
+        "| 审查点关联 | 本体边 | 源→目标 | 约束解释（用于改写 description） |",
+        "|:---|:---|:---|:---|",
+    ]
+    for edge_name, entries in EDGES.items():
+        hint = EDGE_CP_HINTS.get(edge_name, "")
+        # 从 hint 中提取 "→ 审查点XX" 部分
+        review_ref = hint.split("→")[-1].strip() if "→" in hint else hint
+        for entry in entries:
+            lines.append(
+                f"| {review_ref} | `{edge_name}` "
+                f"| `{entry['src']}` → `{entry['dst']}` "
+                f"| {entry['constraint']} |"
+            )
+    return "\n".join(lines)
+
+
+# ── CP 3.2 便捷注入字典 ──────────────────────────────────────────
+
+
+def get_cp_assessor_template_vars() -> dict[str, str]:
+    """返回 CP Point Assessor 提示词所需的全部本体模板变量。
+
+    CP 节点代码实现时：sub_state.update(get_cp_assessor_template_vars())
+    注入 {{ cp_edge_constraints }} 和 {{ element_class_mapping }}。
+    """
+    return {
+        "cp_edge_constraints": render_cp_edge_constraints_for_assessor(),
+        "element_class_mapping": render_element_class_mapping(),
+    }
+
+
+def get_cp_planner_template_vars() -> dict[str, str]:
+    """返回 CP Planner 提示词所需的全部本体模板变量。
+
+    CP 节点代码实现时：sub_state.update(get_cp_planner_template_vars())
+    注入 {{ cp_planner_edge_guide }}。
+    """
+    return {
+        "cp_planner_edge_guide": render_cp_planner_edge_guide(),
+    }
+
+
 # ── P3 便捷注入：CP Analyzer 模板变量字典 ────────────────────────
 
 def get_cp_analyzer_template_vars() -> dict[str, str]:
     """返回 CP Analyzer 提示词所需的全部本体模板变量。
 
     CP 节点代码实现时，在 sub_state 中 `sub_state.update(get_cp_analyzer_template_vars())`
-    即可一行注入 {{ element_class_mapping }} 和 {{ edge_cp_hints }} 两个变量。
+    即可一行注入 {{ element_class_mapping }} 和 {{ edge_topology_with_hints }} 两个变量。
     """
     return {
         "element_class_mapping": render_element_class_mapping(),
-        "edge_cp_hints": render_edge_cp_hints(),
+        "edge_topology_with_hints": render_edge_topology_with_hints(),
     }
 
 
