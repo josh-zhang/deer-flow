@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from functools import partial
 from typing import Annotated, Any, Literal
 from collections import defaultdict
@@ -43,6 +44,7 @@ from .ontology import (
     render_planner_guardrail,
     render_skeleton_for_mapper,
 )
+from .curator_views import format_citations_for_reporter
 from .types import State
 from .utils import (
     build_clarified_topic_from_history,
@@ -244,6 +246,49 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
                     except json.JSONDecodeError:
                         break
     return None
+
+
+def _extract_xml_block(text: str, tag: str) -> str:
+    """提取 <tag>…</tag> 标签内的文本（非贪婪，取第一个匹配）。无匹配返回空串。"""
+    if not text:
+        return ""
+    m = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def _parse_analyst_output(text: str) -> dict[str, Any] | None:
+    """
+    解析 Analyst 输出（XML 标签 + 小 JSON 混合契约）。
+
+    新契约（analyst.md 2026-06-11 起）：
+        <analyst_meta>{ …小 JSON… }</analyst_meta>
+        <analysis_text>…Markdown…</analysis_text>
+        <contradiction_text>…</contradiction_text>
+        <risk_text>…</risk_text>
+
+    兼容路径：未发现 <analyst_meta> 标签时回退到旧版"单一大 JSON"解析，
+    保证旧提示词缓存 / 模型未遵循新契约时不致硬失败。
+
+    返回与旧契约同构的 dict（文本块以 analysis_text 等 key 并入），便于
+    下游（reporter / replanning 判断）无感切换。
+    """
+    if not text or not text.strip():
+        return None
+
+    meta_raw = _extract_xml_block(text, "analyst_meta")
+    if not meta_raw:
+        # 旧契约回退：整体当作一个 JSON 对象解析
+        return _parse_json_object(text)
+
+    parsed = _parse_json_object(meta_raw)
+    if parsed is None:
+        return None
+
+    for tag in ("analysis_text", "contradiction_text", "risk_text"):
+        block = _extract_xml_block(text, tag)
+        if block:
+            parsed[tag] = block
+    return parsed
 
 
 def _normalize_plan_dict(plan_dict: dict[str, Any]) -> dict[str, Any]:
@@ -1123,7 +1168,7 @@ async def analyst_node(state: State, config: RunnableConfig) -> dict:
     sub = {**state, "messages": [HumanMessage(content=human)], "workflow_type": wf}
     llm = get_llm_by_type(AGENT_LLM_MAP.get("analyst", "basic"))
     text = str((await llm.ainvoke(apply_prompt_template("analyst", sub, configurable))).content or "").strip()
-    parsed = _parse_json_object(text)
+    parsed = _parse_analyst_output(text)
     replan = bool(parsed and (parsed.get("replanning_needed") or parsed.get("replanningNeeded")))
     low = text.lower()
     if not replan and '"replanning_needed": true' in low:
@@ -1148,23 +1193,170 @@ async def analyst_node(state: State, config: RunnableConfig) -> dict:
     }
 
 
+def _render_comparison_table_md(table: dict[str, Any]) -> str:
+    """将 analyst 的 comparison_table JSON 结构渲染为 Markdown 表格。
+
+    期望结构：{"dimensions": [...], "objects": {"对象A": {维度: 值}}, "key_differences": [...]}
+    objects 的值兼容 dict（按维度取值）和 list（按维度顺序对位）两种形态。
+    """
+    dims = [str(d) for d in (table.get("dimensions") or [])]
+    objects = table.get("objects") or {}
+    if not dims or not isinstance(objects, dict) or not objects:
+        return ""
+
+    obj_names = [str(k) for k in objects.keys()]
+    lines = [
+        "| 对比维度 | " + " | ".join(obj_names) + " |",
+        "|:---|" + "|".join([":---"] * len(obj_names)) + "|",
+    ]
+    for i, dim in enumerate(dims):
+        row = [dim]
+        for name in obj_names:
+            vals = objects.get(name)
+            cell = ""
+            if isinstance(vals, dict):
+                cell = str(vals.get(dim, "知识库中未查到"))
+            elif isinstance(vals, list):
+                cell = str(vals[i]) if i < len(vals) else "知识库中未查到"
+            elif vals is not None:
+                cell = str(vals)
+            row.append(cell.replace("\n", " ").replace("|", "／") or "知识库中未查到")
+        lines.append("| " + " | ".join(row) + " |")
+
+    diffs = table.get("key_differences") or []
+    if diffs:
+        lines.append("")
+        lines.append("**关键差异**：")
+        for d in diffs:
+            lines.append(f"- {d}")
+    return "\n".join(lines)
+
+
+def _render_analyst_observation_for_reporter(
+    parsed: dict[str, Any], wf: str
+) -> str:
+    """
+    将 analyst_output（已解析 dict）程序化渲染为 reporter 可直接阅读的
+    分节 Markdown，替代向 reporter 注入原始 JSON 文本。
+
+    渲染失败/字段缺失均逐节降级，不抛异常。
+    """
+    parts: list[str] = []
+
+    sc = parsed.get("scope_coverage") or {}
+    if isinstance(sc, dict) and sc:
+        parts.append(
+            "### 调查覆盖范围\n"
+            f"- 完整范围（full_scope）：{'、'.join(map(str, sc.get('full_scope') or [])) or '（不适用）'}\n"
+            f"- 已覆盖（covered）：{'、'.join(map(str, sc.get('covered') or [])) or '（不适用）'}\n"
+            f"- 未覆盖（not_covered）：{'、'.join(map(str, sc.get('not_covered') or [])) or '无'}"
+        )
+
+    conf = parsed.get("overall_confidence")
+    if conf:
+        parts.append(f"### 整体置信度\n{conf}")
+
+    unc = parsed.get("uncovered_aspects") or []
+    if unc:
+        parts.append("### 未覆盖方面\n" + "\n".join(f"- {u}" for u in unc))
+
+    conclusions = parsed.get("conclusions") or []
+    if conclusions:
+        c_lines = ["### 业务结论"]
+        for i, c in enumerate(conclusions, 1):
+            if not isinstance(c, dict):
+                c_lines.append(f"{i}. {c}")
+                continue
+            line = f"{i}. {c.get('statement', '')}（置信度：{c.get('confidence', '')}）"
+            srcs = c.get("supporting_sources") or []
+            if srcs:
+                line += f"\n   - 支撑来源：{'、'.join(f'《{s}》' for s in srcs)}"
+            conds = c.get("conditions")
+            if conds:
+                line += f"\n   - 条件前提：{'；'.join(map(str, conds))}"
+            if c.get("scope_note"):
+                line += f"\n   - 范围说明：{c['scope_note']}"
+            if c.get("expired_only"):
+                line += "\n   - ⚠️ 该结论仅基于已过期依据，仅供历史参考"
+            c_lines.append(line)
+        parts.append("\n".join(c_lines))
+
+    # ── 工作流特定结构 ──
+    if wf == "B":
+        table = parsed.get("comparison_table")
+        if isinstance(table, dict):
+            md = _render_comparison_table_md(table)
+            if md:
+                parts.append("### 对比表格（已渲染）\n" + md)
+    elif wf == "C":
+        enum = parsed.get("enumeration_list")
+        if isinstance(enum, dict) and enum:
+            e_lines = ["### 穷举列表"]
+            if enum.get("condition"):
+                e_lines.append(f"- 穷举条件：{enum['condition']}")
+            for label, key in (
+                ("已确认项目", "confirmed_items"),
+                ("存疑项目", "uncertain_items"),
+                ("仅过期来源项目", "expired_source_items"),
+            ):
+                items = enum.get(key) or []
+                if items:
+                    e_lines.append(f"- {label}：")
+                    e_lines.extend(f"  - {it}" for it in items)
+            if enum.get("completeness_note"):
+                e_lines.append(f"- 完备性说明：{enum['completeness_note']}")
+            parts.append("\n".join(e_lines))
+    elif wf == "D":
+        chain = parsed.get("condition_chain")
+        if isinstance(chain, dict) and chain:
+            d_lines = ["### 条件推理链"]
+            if chain.get("target"):
+                d_lines.append(f"- 判定目标：{chain['target']}")
+            conds = chain.get("conditions") or []
+            if conds:
+                d_lines.append("- 条件清单：")
+                d_lines.extend(f"  - {c}" for c in conds)
+            if chain.get("reasoning_summary"):
+                d_lines.append(f"- 推理概述：{chain['reasoning_summary']}")
+            negs = chain.get("negative_rules") or []
+            if negs:
+                d_lines.append("- 否定性规则：")
+                d_lines.extend(f"  - {n}" for n in negs)
+            parts.append("\n".join(d_lines))
+
+    for title, key, empty_hint in (
+        ("分析过程", "analysis_text", "（无）"),
+        ("矛盾信息处理", "contradiction_text", "未发现矛盾信息。"),
+        ("风险提示", "risk_text", "未发现需要提示的风险。"),
+    ):
+        parts.append(f"### {title}\n{parsed.get(key) or empty_hint}")
+
+    return "\n\n".join(parts)
+
+
 async def reporter_node(state: State, config: RunnableConfig) -> dict:
     configurable = Configuration.from_runnable_config(config)
     plan = state.get("current_plan")
     wf = state.get("workflow_type", "A")
     thought = getattr(plan, "thought", "") if plan else ""
-    observations = list(state.get("observations", []))
-    obs_text = "\n\n---\n\n".join(observations)
-    # citations = [c for c in (state.get("citations") or []) if isinstance(c, dict)]
-    # cit = _format_citation_list_for_reporter(citations)
 
-    citations_section = format_citations_for_reporter(state.get("citations", []))
+    # ── 分析结论：优先消费已解析的 analyst_output（程序化渲染分节 Markdown），
+    #    解析失败时回退到 observations 原文（旧行为） ──
+    analyst_parsed = state.get("analyst_output") or {}
+    if isinstance(analyst_parsed, dict) and analyst_parsed.get("conclusions"):
+        obs_text = _render_analyst_observation_for_reporter(analyst_parsed, wf)
+    else:
+        observations = list(state.get("observations", []))
+        obs_text = "\n\n---\n\n".join(observations)
+
+    citations = [c for c in (state.get("citations") or []) if isinstance(c, dict)]
+    citations_section = format_citations_for_reporter(citations)
 
     q = state.get("clarified_research_topic") or state.get("research_topic", "")
     human = (
         f"## 1. 调查原始问题\n{q}\n\n"
         f"## 2. 调查计划制定思路\n{thought or '（无）'}\n\n"
-        f"## 3. Analyst 的 observations\n{obs_text or '（无）'}\n\n"
+        f"## 3. 分析结论\n{obs_text or '（无）'}\n\n"
         f"## 4. 可用参考来源\n{citations_section}\n"
     )
     sub = {**state, "workflow_type": wf, "messages": [HumanMessage(content=human)]}
