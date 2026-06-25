@@ -36,7 +36,7 @@ from src.prompts.template import apply_prompt_template, get_system_prompt_templa
 from src.tools import crawl_tool, get_retriever_tool
 from src.utils.context_manager import ContextManager
 from src.utils.json_utils import repair_json_output, sanitize_tool_response
-from src.extraction.chunk_extractor import ExtractionResult
+from src.tools.extractor import ExtractionResult
 
 from .ontology import (
     extract_ontology_mapping,
