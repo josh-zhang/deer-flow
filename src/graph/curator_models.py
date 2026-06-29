@@ -167,17 +167,40 @@ def normalize_doc_title(title: str) -> str:
     return _STRIP_CHARS_PATTERN.sub("", title).strip()
 
 
+def _extract_doc_name_candidates(raw_title: str) -> list[str]:
+    """
+    从可能包含多个文档名的字符串中提取候选文档名。
+
+    Curator 偶尔违反合并规则，在来源字段拼接多个文档名，例如：
+    - "《信用卡分期业务管理办法》《白金卡产品说明书》"
+    - "《文档A》/《文档B》"
+
+    此函数用于防御性解析：拆出候选名取第一个匹配的 chunk_map。
+
+    返回按《》提取出的候选名列表（不含装饰符）。
+    如果输入不含《》，返回空列表。
+    """
+    bracketed = re.findall(r"《([^》]+)》", raw_title)
+    if not bracketed:
+        return []
+    return [name.strip() for name in bracketed if name.strip()]
+
+
 def fuzzy_match_chunk_map(
     curator_doc_title: str,
     document_chunk_maps: dict[str, dict[str, str]],
 ) -> dict[str, str] | None:
     """
-    三级匹配策略查找 chunk_map：
+    四级匹配策略查找 chunk_map：
     1. 精确匹配
     2. 归一化后精确匹配
     3. 归一化后包含匹配（一方包含另一方）
+    4. 多文档名拆分匹配（防御性：取第一个命中的）
 
     返回 chunk_map 或 None。
+
+    注意：每条 evidence 设计上只对应一个文档。Level 4 仅用于防御
+    LLM 偶尔违反合并规则（在来源字段拼接多个文档名）的情况。
     """
     # Level 1: 精确匹配
     if curator_doc_title in document_chunk_maps:
@@ -204,6 +227,18 @@ def fuzzy_match_chunk_map(
             )
             return chunk_map
 
+    # Level 4: 多文档名拆分匹配（防御性：取第一个命中的）
+    candidates = _extract_doc_name_candidates(curator_doc_title)
+    if candidates:
+        for candidate in candidates:
+            result = fuzzy_match_chunk_map(candidate, document_chunk_maps)
+            if result is not None:
+                logger.warning(
+                    "来源字段包含多个文档名（违反合并规则），取第一个匹配：'%s' → '%s'",
+                    curator_doc_title, candidate,
+                )
+                return result
+
     return None
 
 
@@ -219,7 +254,7 @@ def resolve_all_evidence_chunks(
         metadata, content = _find_content_boundary(evidence.body)
         doc_title = evidence.source_document
 
-        # ── 模糊匹配替代精确查询 ──
+        # ── 模糊匹配查找 chunk_map ──
         chunk_map = fuzzy_match_chunk_map(doc_title, document_chunk_maps)
 
         if chunk_map is None:
