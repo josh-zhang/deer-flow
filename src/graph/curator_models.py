@@ -79,7 +79,7 @@ def _enrich_evidence(evidence: EvidenceItem) -> None:
         if stripped.startswith("来源：") or stripped.startswith("来源:"):
             evidence.source_document = _extract_after_colon(stripped)
 
-        elif stripped.startswith("引用段落：") or stripped.startswith("引用段落:"):
+        elif stripped.startswith("段落编号：") or stripped.startswith("段落编号:") or stripped.startswith("引用段落：") or stripped.startswith("引用段落:"):
             raw = _extract_after_colon(stripped)
             # "1, 3, 7, 15" → ["1", "3", "7", "15"]
             evidence.referenced_chunks = [
