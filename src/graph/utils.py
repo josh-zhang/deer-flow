@@ -124,7 +124,7 @@ ATTACHED_TEXT_MAX_CHARS = 50_000
 
 
 def format_attached_files_for_prompt(
-    state: Any, max_chars_per_file: int = ATTACHED_TEXT_MAX_CHARS
+    attached_files: list[dict], max_chars_per_file: int = ATTACHED_TEXT_MAX_CHARS
 ) -> str:
     """Render state["attached_files"] as a markdown block for prompt injection.
 
@@ -134,12 +134,8 @@ def format_attached_files_for_prompt(
     Returns an empty string when there are no attachments — callers can
     unconditionally concatenate.
     """
-    files = (state or {}).get("attached_files") or []
-    if not files:
-        return ""
-
     sections: list[str] = []
-    for f in files:
+    for f in attached_files:
         name = f.get("name", "unnamed")
         kind = f.get("kind")
         if kind == "text":
