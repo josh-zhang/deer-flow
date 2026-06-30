@@ -174,16 +174,41 @@ def _extract_doc_name_candidates(raw_title: str) -> list[str]:
     Curator 偶尔违反合并规则，在来源字段拼接多个文档名，例如：
     - "《信用卡分期业务管理办法》《白金卡产品说明书》"
     - "《文档A》/《文档B》"
+    - "文档A、文档B"（无书名号）
+    - "「文档A」「文档B」"
 
     此函数用于防御性解析：拆出候选名取第一个匹配的 chunk_map。
 
-    返回按《》提取出的候选名列表（不含装饰符）。
-    如果输入不含《》，返回空列表。
+    策略：
+    1. 优先从各种括号对中提取（《》「」『』〈〉【】）
+    2. 如无括号对，按常见分隔符拆分（、/；;和）
+    3. 过滤掉过短的碎片（≤2字符，可能是拆分噪音）
+
+    返回候选名列表（不含装饰符）。如果只能提取到一个候选，返回空列表（单文档无需拆分）。
     """
-    bracketed = re.findall(r"《([^》]+)》", raw_title)
-    if not bracketed:
-        return []
-    return [name.strip() for name in bracketed if name.strip()]
+    # 策略 1: 从括号对中提取
+    bracket_patterns = [
+        r"《([^》]+)》",
+        r"「([^」]+)」",
+        r"『([^』]+)』",
+        r"〈([^〉]+)〉",
+        r"【([^】]+)】",
+    ]
+    for pattern in bracket_patterns:
+        found = re.findall(pattern, raw_title)
+        if len(found) >= 2:
+            return [name.strip() for name in found if name.strip()]
+
+    # 策略 2: 无括号对时，按分隔符拆分
+    # 常见分隔符：中文顿号、斜杠、分号、"和"/"与"
+    parts = re.split(r"[、/；;]|(?<=[\u4e00-\u9fff])和(?=[\u4e00-\u9fff])", raw_title)
+    candidates = [normalize_doc_title(p.strip()) for p in parts if p.strip()]
+    # 过滤过短碎片（≤2字符可能是拆分噪音如"和""与"）
+    candidates = [c for c in candidates if len(c) > 2]
+    if len(candidates) >= 2:
+        return candidates
+
+    return []
 
 
 def fuzzy_match_chunk_map(
