@@ -37,6 +37,9 @@ from src.tools import crawl_tool, get_retriever_tool
 from src.utils.context_manager import ContextManager
 from src.utils.json_utils import repair_json_output, sanitize_tool_response
 from src.tools.extractor import ExtractionResult
+from src.graph.curator_parser import extract_citations_from_cache, parse_curator_output
+from src.graph.curator_models import resolve_all_evidence_chunks
+from src.agents.agents import PreModelHookMiddleware
 
 from .ontology import (
     extract_ontology_mapping,
@@ -44,7 +47,8 @@ from .ontology import (
     render_planner_guardrail,
     render_skeleton_for_mapper,
 )
-from .curator_views import format_citations_for_reporter
+from .curator_views import format_citations_for_reporter, generate_rule_splitter_view
+from .planner_model import Step
 from .types import State
 from .utils import (
     build_clarified_topic_from_history,
@@ -964,84 +968,108 @@ async def coordinator_node(state: State, config: RunnableConfig) -> Command:
     )
 
 
-async def researcher_node(state: State, config: RunnableConfig) -> dict:
-    configurable = Configuration.from_runnable_config(config)
-    plan = state.get("current_plan")
-    step = _first_research_step_pending_researcher(plan)
-    if step is None:
-        return {**preserve_state_meta_fields(state)}
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  5. Searcher Node 集成示例
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    tools = [t for t in [get_retriever_tool(state.get("resources", [])), crawl_tool] if t]
-    locale = state.get("locale", "zh_CN")
-    wf = state.get("workflow_type", "A")
-    wf_label = {"A": "A 定点调查", "B": "B 并行对比", "C": "C 扫描穷举", "D": "D 条件推理"}.get(
-        wf, "A 定点调查"
-    )
-    summaries = "\n\n".join(state.get("searcher_summaries", [])) or "（无）"
+async def researcher_node(state: dict) -> dict:
+    """
+    Searcher 节点：执行 ReAct agent，缓存工具返回，格式化输出。
+
+    返回更新 State 的字段：
+    - searcher_results:         Curator 的原始工具返回 Markdown（追加当前步骤）
+    - searcher_summaries:       Searcher 检索摘要文本（追加当前步骤）
+    - document_chunk_maps:      全局文档 chunk_map 累积（合并更新）
+    - document_metadata:        全局文档元数据累积（合并更新）
+    """
+    current_step = None
+    complete_steps = []
+    plan = state.get("current_plan")
+    for step in plan.steps:
+        if not step.execution_res:
+            current_step = step
+        else:
+            complete_steps.append(step)
+
+    searcher_results = state.get("searcher_results")
+
+    complete_step_info = ""
+    step_index = 1
+    for searcher_result, _ in searcher_results:
+        complete_step_info += f"# 已完成步骤{step_index}-检索\n\n{searcher_result}\n\n"
+
     q = state.get("clarified_research_topic") or state.get("research_topic", "")
+
     user = (
         f"## 调查原始问题\n{q}\n\n## 工作流类型\n{wf_label}\n\n"
         f"## 已完成步骤检索摘要\n{summaries}\n\n"
         f"## 当前步骤\n- 标题：{step.title}\n- 背景：{step.background}\n- 检索内容：{step.description}\n"
     )
-    attachments_block = format_attached_files_for_prompt(state)
-    if attachments_block:
-        user += f"\n## 用户附件\n\n{attachments_block}\n"
-    rs = _research_steps(plan)
-    step_no = next((i + 1 for i, s in enumerate(rs) if s is step), 0)
 
-    llm_limit = get_llm_token_limit_by_type(AGENT_LLM_MAP.get("researcher", "basic"))
-    hook = partial(ContextManager(llm_limit, 3).compress_messages)
-    agent = create_agent(
-        "researcher",
-        "researcher",
-        tools,
-        "researcher",
-        hook,
-        interrupt_before_tools=configurable.interrupt_before_tools,
-        locale=locale,
+    tool_returns_cache: list[ToolCallRecord] = []
+
+    llm_limit = get_llm_token_limit_by_type(
+        AGENT_LLM_MAP.get("researcher", "basic")
     )
-    try:
-        out = await agent.ainvoke({"messages": [HumanMessage(content=user)]}, config={"recursion_limit": 25})
-        ams = out.get("messages", [])
-        light = sanitize_tool_response(str(get_message_content(_last_ai_message(ams)) or ""))
-        raw = _extract_tool_payloads_from_messages(ams)
-        bundle = f"## Step {step_no} — {step.title}\n### 检索注释\n{light}\n\n### 原始工具返回\n{raw}"
-        step.execution_res = f"{_RESEARCHER_TAG}\n{light}"
-    except GraphRecursionError as e:
-        logger.warning("researcher recursion_limit fallback: %s", e)
-        ams = await _handle_recursion_limit_fallback(
-            [HumanMessage(content=user)],
-            "researcher",
-            state,
-        )
-        light = sanitize_tool_response(str(get_message_content(_last_ai_message(ams)) or ""))
-        raw = _extract_tool_payloads_from_messages(ams)
-        bundle = (
-            f"## Step {step_no} — {step.title}\n"
-            f"### 检索注释\n{light}\n\n"
-            f"### 原始工具返回\n{raw}"
-        )
-        step.execution_res = f"{_RESEARCHER_TAG}\n{light}"
-    except Exception as e:
-        logger.exception("researcher: %s", e)
-        step.execution_res = f"{_RESEARCHER_TAG}\n错误: {e}"
-        return {
-            **preserve_state_meta_fields(state),
-            "current_plan": plan,
-            "searcher_results": state.get("searcher_results", [])
-            + [f"## Step {step_no}\n### 错误\n{step.execution_res}"],
-        }
-    
+
+    middleware = [
+        # ① 先执行：缓存 ToolMessage artifact
+        PreModelHookMiddleware(make_tool_saver_hook(tool_returns_cache)),
+        # ② 后执行：消息压缩（可能删除旧 ToolMessage）
+        PreModelHookMiddleware(partial(
+            ContextManager(llm_limit, 3).compress_messages
+        )),
+    ]
+
+    hook = partial(ContextManager(llm_limit, 3).compress_messages)
+
+    tools = [t for t in [get_retriever_tool(state.get("resources", [])), crawl_tool] if t]
+
+    agent = create_agent(
+        name="searcher",
+        model=llm_model,
+        tools=tools,
+        hook=hook,
+        middleware=middleware,
+    )
+
+    result = await agent.astream(state["messages"])
+
+    # Curator 输入
+    curator_tool_input = format_tool_cache_for_curator(tool_returns_cache, current_step.title)
+
+    # Chunk maps（全局累积）
+    new_chunk_maps = extract_chunk_maps_from_cache(tool_returns_cache)
+    existing_maps = state.get("document_chunk_maps", {})
+    for doc_title, cmap in new_chunk_maps.items():
+        if doc_title in existing_maps:
+            existing_maps[doc_title].update(cmap)
+        else:
+            existing_maps[doc_title] = cmap
+
+    # Document metadata（全局累积）
+    new_metadata = extract_document_metadata_from_cache(tool_returns_cache)
+    existing_metadata = state.get("document_metadata", {})
+    existing_metadata.update(new_metadata)
+
+    # Citations（跨步骤 merge）
+    new_citations = extract_citations_from_cache(tool_returns_cache)
+    existing_citations = state.get("citations", [])
+    merged_citations = merge_citations(existing_citations, new_citations)
+
     return {
-        **preserve_state_meta_fields(state),
-        "current_plan": plan,
-        "searcher_results": state.get("searcher_results", []) + [bundle],
-            "citations": merge_citations(
-                state.get("citations", []),
-                extract_citations_from_messages(ams),
-            ),
+        "messages": result["messages"],
+        # Curator 输入：Markdown 格式的工具返回
+        "searcher_results": [curator_tool_input],
+        # Searcher 检索摘要（从 agent 最终文本输出提取）
+        "searcher_summaries": [result],
+        # 全局 chunk_map 累积
+        "document_chunk_maps": existing_maps,
+        # 全局文档元数据累积
+        "document_metadata": existing_metadata,
+        "citations": merged_citations,
     }
+
 
 async def curator_node(state: State, config: RunnableConfig) -> dict:
     configurable = Configuration.from_runnable_config(config)
@@ -1062,14 +1090,30 @@ async def curator_node(state: State, config: RunnableConfig) -> dict:
     sub = {**state, "messages": [HumanMessage(content=human)]}
     llm = get_llm_by_type(AGENT_LLM_MAP.get("curator", "basic"))
     content = str((await llm.ainvoke(apply_prompt_template("curator", sub, configurable))).content or "")
+
+    # ── P0: 解析 CuratorOutput → 从 chunk_map 重建段落原文 → 生成 resolved 视图 ──
+    resolved_view = None
+    try:
+        curator_output = parse_curator_output(content)
+        chunk_maps = state.get("document_chunk_maps", {})
+        if chunk_maps:
+            resolved_list = resolve_all_evidence_chunks(curator_output, chunk_maps)
+            resolved_view = generate_rule_splitter_view(curator_output, resolved_list)
+    except Exception as e:
+        logger.warning("P0 视图生成失败，回退至原始 JSON: %s", e)
+
+    # ── 回退路径：原始 JSON（解析失败或无 chunk_map 时）──
     parsed = _parse_json_object(content)
     full = json.dumps(parsed, ensure_ascii=False, indent=2) if parsed else content
     summary = _generate_searcher_summary(
         step.title, step.description, parsed if isinstance(parsed, dict) else {}
     )
     step.execution_res = f"{_CURATOR_TAG}\n{full}"
+
+    # 优先使用 resolved 视图（含 chunk_map 原文），否则回退到原始 JSON
+    view_content = resolved_view if resolved_view else full
     views = list(state.get("curator_rule_splitter_views", [])) + [
-        f"### 步骤 {idx} 信息质量评估\n{full}"
+        f"### 步骤 {idx} 信息质量评估\n{view_content}"
     ]
     sums = list(state.get("searcher_summaries", [])) + [summary]
     return {
@@ -1785,73 +1829,3 @@ def extract_document_metadata_from_cache(
 
     return metadata
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  5. Searcher Node 集成示例
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-async def searcher_node(state: dict) -> dict:
-    """
-    Searcher 节点：执行 ReAct agent，缓存工具返回，格式化输出。
-
-    返回更新 State 的字段：
-    - searcher_results:         Curator 的原始工具返回 Markdown（追加当前步骤）
-    - searcher_summaries:       Searcher 检索摘要文本（追加当前步骤）
-    - document_chunk_maps:      全局文档 chunk_map 累积（合并更新）
-    - document_metadata:        全局文档元数据累积（合并更新）
-    """
-    tool_returns_cache: list[ToolCallRecord] = []
-
-    middleware = [
-        # ① 先执行：缓存 ToolMessage artifact
-        PreModelHookMiddleware(make_tool_saver_hook(tool_returns_cache)),
-        # ② 后执行：消息压缩（可能删除旧 ToolMessage）
-        PreModelHookMiddleware(partial(
-            ContextManager(llm_token_limit, 3).compress_messages
-        )),
-    ]
-
-    agent = create_agent(
-        name="searcher",
-        model=llm_model,
-        tools=tools,
-        middleware=middleware,
-    )
-
-    result = await agent.astream(state["messages"])
-
-    # Curator 输入
-    step_title = state.get("current_step_title", "")
-    curator_tool_input = format_tool_cache_for_curator(tool_returns_cache, step_title)
-
-    # Chunk maps（全局累积）
-    new_chunk_maps = extract_chunk_maps_from_cache(tool_returns_cache)
-    existing_maps = state.get("document_chunk_maps", {})
-    for doc_title, cmap in new_chunk_maps.items():
-        if doc_title in existing_maps:
-            existing_maps[doc_title].update(cmap)
-        else:
-            existing_maps[doc_title] = cmap
-
-    # Document metadata（全局累积）
-    new_metadata = extract_document_metadata_from_cache(tool_returns_cache)
-    existing_metadata = state.get("document_metadata", {})
-    existing_metadata.update(new_metadata)
-
-    # Citations（跨步骤 merge）
-    new_citations = extract_citations_from_cache(tool_returns_cache)
-    existing_citations = state.get("citations", [])
-    merged_citations = merge_citations(existing_citations, new_citations)
-
-    return {
-        "messages": result["messages"],
-        # Curator 输入：Markdown 格式的工具返回
-        "searcher_results": [curator_tool_input],
-        # Searcher 检索摘要（从 agent 最终文本输出提取）
-        "searcher_summaries": [extract_final_text(result)],
-        # 全局 chunk_map 累积
-        "document_chunk_maps": existing_maps,
-        # 全局文档元数据累积
-        "document_metadata": existing_metadata,
-        "citations": merged_citations,
-    }
