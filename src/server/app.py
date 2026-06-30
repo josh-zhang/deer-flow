@@ -44,6 +44,7 @@ from src.graph.checkpoint import chat_stream_message
 from src.graph.utils import (
     build_clarified_topic_from_history,
     reconstruct_clarification_history,
+    format_attached_files_for_prompt
 )
 from src.llms.llm import get_configured_llm_models
 from src.rag.builder import build_retriever
@@ -811,6 +812,10 @@ async def _astream_workflow_generator(
             f"[{safe_thread_id}] Received {len(attached_files)} attached file(s) "
             f"this turn: {[(a['name'], a['kind']) for a in attached_files]}"
         )
+
+        attachments_block = format_attached_files_for_prompt(attached_files)
+        if attachments_block:
+            latest_message_content += f"\n## 用户附件\n\n{attachments_block}\n"
 
     if not auto_accepted_plan and interrupt_feedback:
         logger.debug(f"[{safe_thread_id}] Creating resume command with interrupt_feedback: {safe_feedback}")
