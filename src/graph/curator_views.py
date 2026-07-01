@@ -16,18 +16,18 @@ def _find_content_boundary(body: str) -> tuple[str, str]:
     """
     将 evidence body 文本分为 metadata 部分和 content 部分。
 
-    约定：body 中 "具体内容：" 行以下为 content。
+    约定：body 中 "段落编号：" 行为分界线。
     如果找不到，整个 body 视为 metadata（存疑-低等无 content 的情况）。
 
     返回 (metadata_text, content_text)，content_text 可能为空字符串。
     """
-    # 查找 "具体内容：" 或 "具体内容:" 行
+    # 查找 "段落编号：" 行
     lines = body.split("\n")
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("具体内容") and ("：" in stripped or ":" in stripped):
+        if stripped.startswith("段落编号") and ("：" in stripped or ":" in stripped):
             metadata = "\n".join(lines[:i])
-            # 具体内容可能紧跟在冒号后，也可能在下一行
+            # 段落编号可能紧跟在冒号后，也可能在下一行
             colon_pos = stripped.find("：")
             if colon_pos == -1:
                 colon_pos = stripped.find(":")

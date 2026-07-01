@@ -151,8 +151,8 @@ class ResolvedEvidence:
     evidence_id: str
     relevance: str
     source_document: str
-    body_metadata: str            # body 中"具体内容"之前的部分
-    body_content: str             # body 中"具体内容"之后的部分（Curator 精简后的文本）
+    body_metadata: str            # body 中"段落编号"之前的部分
+    body_content: str             # body 中"段落编号"及之后的部分
     referenced_chunks: list[str]  # Curator 引用的段落编号
     resolved_chunks: list[dict]   # 从 chunk_map 解析的原文 [{chunk_index, chunk_content}]
     is_expired: bool
@@ -285,7 +285,7 @@ def resolve_all_evidence_chunks(
         if chunk_map is None:
             logger.warning(
                 "Evidence %s 的文档 '%s' 在 chunk_maps 中未找到（含模糊匹配）。"
-                "回退至 body 中的具体内容。chunk_maps 现有 keys: %s",
+                "回退至 body 原始内容。chunk_maps 现有 keys: %s",
                 evidence.id, doc_title, list(document_chunk_maps.keys()),
             )
             chunk_map = {}
@@ -320,11 +320,15 @@ def resolve_all_evidence_chunks(
 
 
 def _find_content_boundary(body: str) -> tuple[str, str]:
-    """将 body 分为 metadata / content 两段（以"具体内容"行为界）。"""
+    """将 body 分为 metadata / content 两段（以"段落编号"行为界）。
+
+    LLM 输出 body 模板中，段落编号是最后一个一级字段，其后不再有
+    "具体内容"包装层。此函数匹配"段落编号："作为分界线。
+    """
     lines = body.split("\n")
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("具体内容") and ("：" in stripped or ":" in stripped):
+        if stripped.startswith("段落编号") and ("：" in stripped or ":" in stripped):
             metadata = "\n".join(lines[:i])
             colon_pos = stripped.find("：")
             if colon_pos == -1:
