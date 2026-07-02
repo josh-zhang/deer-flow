@@ -76,7 +76,7 @@ def _enrich_evidence(evidence: EvidenceItem) -> None:
     for line in evidence.body.split("\n"):
         stripped = line.strip()
 
-        if stripped.startswith("来源：") or stripped.startswith("来源:"):
+        if stripped.startswith("来源文档：") or stripped.startswith("来源文档:"):
             evidence.source_document = _extract_after_colon(stripped)
 
         elif stripped.startswith("段落编号：") or stripped.startswith("段落编号:") or stripped.startswith("引用段落：") or stripped.startswith("引用段落:"):
@@ -171,7 +171,7 @@ def _extract_doc_name_candidates(raw_title: str) -> list[str]:
     """
     从可能包含多个文档名的字符串中提取候选文档名。
 
-    Curator 偶尔违反合并规则，在来源字段拼接多个文档名，例如：
+    Curator 偶尔违反合并规则，在来源文档字段拼接多个文档名，例如：
     - "《信用卡分期业务管理办法》《白金卡产品说明书》"
     - "《文档A》/《文档B》"
     - "文档A、文档B"（无书名号）
@@ -225,7 +225,7 @@ def fuzzy_match_chunk_map(
     返回 chunk_map 或 None。
 
     注意：每条 evidence 设计上只对应一个文档。Level 4 仅用于防御
-    LLM 偶尔违反合并规则（在来源字段拼接多个文档名）的情况。
+    LLM 偶尔违反合并规则（在来源文档字段拼接多个文档名）的情况。
     """
     # Level 1: 精确匹配
     if curator_doc_title in document_chunk_maps:
@@ -259,7 +259,7 @@ def fuzzy_match_chunk_map(
             result = fuzzy_match_chunk_map(candidate, document_chunk_maps)
             if result is not None:
                 logger.warning(
-                    "来源字段包含多个文档名（违反合并规则），取第一个匹配：'%s' → '%s'",
+                    "来源文档字段包含多个文档名（违反合并规则），取第一个匹配：'%s' → '%s'",
                     curator_doc_title, candidate,
                 )
                 return result
