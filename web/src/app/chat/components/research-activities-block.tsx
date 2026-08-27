@@ -26,7 +26,7 @@ import {
 } from "~/components/ui/accordion";
 import { Skeleton } from "~/components/ui/skeleton";
 import { findMCPTool } from "~/core/mcp";
-import type { ToolCallRuntime } from "~/core/messages";
+import type { Message, ToolCallRuntime } from "~/core/messages";
 import { useMessage, useStore } from "~/core/store";
 import { parseJSON } from "~/core/utils";
 import { cn } from "~/lib/utils";
@@ -69,6 +69,37 @@ interface DocumentSummary {
 const MAX_ANIMATED_ITEMS = 10; // Only animate first 10 items
 const ANIMATION_DELAY_MULTIPLIER = 0.05; // Reduced delay between animations
 
+// ── 工具返回展示开关 ──────────────────────────────────
+// local_search / crawl 工具返回的是文档 id（file_id / chunk_index 等），
+// 对用户是噪音。先临时禁用返回内容展示（保留「正在检索/阅读/抓取」过程提示行）。
+// 恢复展示：改为 true 即可。
+const SHOW_TOOL_RETURNS = false;
+
+/**
+ * ActivityMessage 是否会对该消息渲染正文。
+ * 与 ActivityMessage 组件内部的判定保持单一来源。
+ */
+function shouldShowActivityMessage(message: Message | undefined): boolean {
+  if (!message?.agent || !message.content) return false;
+  // researcher（searcher）只展示最终的结构化「检索摘要」，隐藏 ReAct 中间输出
+  if (message.agent === "researcher" && !message.content.includes("检索摘要")) {
+    return false;
+  }
+  return message.agent !== "reporter" && message.agent !== "planner";
+}
+
+/**
+ * ActivityListItem 是否至少有一个会渲染的工具调用。
+ * 与 ActivityListItem 组件内部的 filter 判定保持单一来源。
+ */
+function shouldShowActivityToolCalls(message: Message | undefined): boolean {
+  if (!message || message.isStreaming || !message.toolCalls?.length) return false;
+  return message.toolCalls.some(
+    (toolCall) =>
+      !(typeof toolCall.result === "string" && toolCall.result?.startsWith("Error")),
+  );
+}
+
 export function ResearchActivitiesBlock({
   className,
   researchId,
@@ -87,27 +118,13 @@ export function ResearchActivitiesBlock({
         {activityIds.map(
           (activityId, i) => {
             if (i === 0) return null;
-            
-            // Performance optimization: limit animations for large lists
-            const shouldAnimate = i < MAX_ANIMATED_ITEMS;
-            const animationDelay = shouldAnimate ? Math.min(i * ANIMATION_DELAY_MULTIPLIER, 0.5) : 0;
-            
             return (
-              <motion.li
+              <ActivityItem
                 key={activityId}
-                style={{ transition: shouldAnimate ? "all 0.3s ease-out" : "none" }}
-                initial={shouldAnimate ? { opacity: 0, y: 24 } : { opacity: 1, y: 0 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={shouldAnimate ? {
-                  duration: 0.3, // Reduced from 0.4
-                  delay: animationDelay,
-                  ease: "easeOut",
-                } : undefined}
-              >
-                <ActivityMessage messageId={activityId} />
-                <ActivityListItem messageId={activityId} />
-                {i !== activityIds.length - 1 && <hr className="my-8" />}
-              </motion.li>
+                activityId={activityId}
+                index={i}
+                isLast={i === activityIds.length - 1}
+              />
             );
           },
         )}
@@ -117,20 +134,68 @@ export function ResearchActivitiesBlock({
   );
 }
 
+const ActivityItem = React.memo(
+  ({
+    activityId,
+    index,
+    isLast,
+  }: {
+    activityId: string;
+    index: number;
+    isLast: boolean;
+  }) => {
+    const message = useMessage(activityId);
+
+    // 两个子组件都不渲染内容时，整条活动（含 hr 分隔线）不渲染
+    if (
+      !shouldShowActivityMessage(message) &&
+      !shouldShowActivityToolCalls(message)
+    ) {
+      return null;
+    }
+
+    // Performance optimization: limit animations for large lists
+    const shouldAnimate = index < MAX_ANIMATED_ITEMS;
+    const animationDelay = shouldAnimate
+      ? Math.min(index * ANIMATION_DELAY_MULTIPLIER, 0.5)
+      : 0;
+
+    return (
+      <motion.li
+        style={{ transition: shouldAnimate ? "all 0.3s ease-out" : "none" }}
+        initial={shouldAnimate ? { opacity: 0, y: 24 } : { opacity: 1, y: 0 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={
+          shouldAnimate
+            ? {
+                duration: 0.3, // Reduced from 0.4
+                delay: animationDelay,
+                ease: "easeOut",
+              }
+            : undefined
+        }
+      >
+        <ActivityMessage messageId={activityId} />
+        <ActivityListItem messageId={activityId} />
+        {!isLast && <hr className="my-8" />}
+      </motion.li>
+    );
+  },
+);
+ActivityItem.displayName = "ActivityItem";
+
 const ActivityMessage = React.memo(({ messageId }: { messageId: string }) => {
   const message = useMessage(messageId);
-  if (message?.agent && message.content) {
-    if (message.agent !== "reporter" && message.agent !== "planner") {
-      return (
-        <div className="px-4 py-2">
-          <Markdown animated checkLinkCredibility>
-            {message.content}
-          </Markdown>
-        </div>
-      );
-    }
+  if (!message || !shouldShowActivityMessage(message)) {
+    return null;
   }
-  return null;
+  return (
+    <div className="px-4 py-2">
+      <Markdown animated checkLinkCredibility>
+        {message.content}
+      </Markdown>
+    </div>
+  );
 });
 ActivityMessage.displayName = "ActivityMessage";
 
@@ -339,9 +404,11 @@ function extractDocsFromArtifact(
 
 function extractDocsFromMarkdown(content: string): DocumentSummary[] {
   const docs: DocumentSummary[] = [];
+  // 文档头分隔符兼容：本地版 em-dash（—）、行内版短横线（-）
   const docHeaderRe =
-    /\*\*文档\s*\d+\*\*\s*—\s*《(.+?)》(?:\s*\|\s*(?:url:\s*(\S+))?)?(?:\s*\|\s*编号:\s*(\S+))?/g;
-  const chunkRe = /\*\*\[.+?\]\*\*/g;
+    /\*\*文档\s*\d+\*\*\s*(?:—|-|–)\s*《(.+?)》(?:\s*\|\s*(?:url:\s*(\S+))?)?(?:\s*\|\s*编号:\s*(\S+))?/g;
+  // 段落标记兼容：本地版 **[3]**、行内版 **段落[3]**
+  const chunkRe = /\*\*(?:段落)?\[.+?\]\*\*/g;
 
   const sections = content.split(/^---$/m);
 
@@ -466,7 +533,26 @@ function RetrieverToolCall({ toolCall }: { toolCall: ToolCallRuntime }) {
 
     // 优先从 artifact 解析
     const artifact = getArtifact(toolCall);
-    if (artifact) return extractDocsFromArtifact(artifact);
+    const artifactDocs = artifact ? extractDocsFromArtifact(artifact) : null;
+
+    // artifact 的 chunks 目前可能为空（后端契约未对齐）。
+    // 前端只需展示每个文档的 chunk 数：chunks 全为空时，
+    // 回退到 Markdown 解析，按索引对齐回填段落数。
+    if (
+      artifactDocs &&
+      artifactDocs.length > 0 &&
+      artifactDocs.every((d) => d.chunkCount === 0) &&
+      typeof toolCall.result === "string"
+    ) {
+      const mdDocs = extractDocsFromMarkdown(toolCall.result);
+      if (mdDocs.length > 0) {
+        return artifactDocs.map((doc, i) => ({
+          ...doc,
+          chunkCount: mdDocs[i]?.chunkCount ?? doc.chunkCount,
+        }));
+      }
+    }
+    if (artifactDocs) return artifactDocs;
 
     // 回退：从 Markdown 解析
     if (typeof toolCall.result === "string") {
@@ -481,7 +567,14 @@ function RetrieverToolCall({ toolCall }: { toolCall: ToolCallRuntime }) {
           title: d.title || `文档 ${i + 1}`,
           url: d.url || null,
           fileId: d.id || null,
-          chunkCount: 1,
+          // 旧格式 content 为多段落拼接文本，按空行粗数；无 content 时至少记 1
+          chunkCount:
+            typeof d.content === "string"
+              ? Math.max(
+                  1,
+                  d.content.split("\n\n").filter((s: string) => s.trim()).length,
+                )
+              : 1,
           isExtracted: false,
         }));
       }
@@ -502,40 +595,42 @@ function RetrieverToolCall({ toolCall }: { toolCall: ToolCallRuntime }) {
         </RainbowText>
       </div>
 
-      <div className="pr-4">
-        <ul className="mt-2 flex flex-wrap gap-3">
-          {/* skeleton loading */}
-          {searching &&
-            [...Array(2)].map((_, i) => (
-              <li
-                key={`skeleton-${i}`}
-                className="flex h-24 w-44 gap-2 rounded-md text-sm"
-              >
-                <Skeleton
-                  className="to-accent h-full w-full rounded-md bg-gradient-to-tl from-slate-400"
-                  style={{ animationDelay: `${i * 0.2}s` }}
-                />
-              </li>
+      {SHOW_TOOL_RETURNS && (
+        <div className="pr-4">
+          <ul className="mt-2 flex flex-wrap gap-3">
+            {/* skeleton loading */}
+            {searching &&
+              [...Array(2)].map((_, i) => (
+                <li
+                  key={`skeleton-${i}`}
+                  className="flex h-24 w-44 gap-2 rounded-md text-sm"
+                >
+                  <Skeleton
+                    className="to-accent h-full w-full rounded-md bg-gradient-to-tl from-slate-400"
+                    style={{ animationDelay: `${i * 0.2}s` }}
+                  />
+                </li>
+              ))}
+
+            {/* document cards */}
+            {documents.map((doc, i) => (
+              <DocumentCard
+                key={`doc-${doc.title}-${i}`}
+                doc={doc}
+                index={i}
+              />
             ))}
+          </ul>
 
-          {/* document cards */}
-          {documents.map((doc, i) => (
-            <DocumentCard
-              key={`doc-${doc.title}-${i}`}
-              doc={doc}
-              index={i}
-            />
-          ))}
-        </ul>
-
-        {/* 结果统计 */}
-        {!searching && documents.length > 0 && (
-          <p className="text-muted-foreground/50 mt-1 text-xs">
-            找到 {documents.length} 份文档，
-            共 {documents.reduce((sum, d) => sum + d.chunkCount, 0)} 个段落
-          </p>
-        )}
-      </div>
+          {/* 结果统计 */}
+          {!searching && documents.length > 0 && (
+            <p className="text-muted-foreground/50 mt-1 text-xs">
+              找到 {documents.length} 份文档，
+              共 {documents.reduce((sum, d) => sum + d.chunkCount, 0)} 个段落
+            </p>
+          )}
+        </div>
+      )}
     </section>
   );
 }
@@ -608,51 +703,53 @@ function CrawlToolCall({ toolCall }: { toolCall: ToolCallRuntime }) {
         </RainbowText>
       </div>
 
-      <ul className="mt-2 flex flex-wrap gap-3">
-        {loading ? (
-          <li className="flex h-24 w-56 rounded-md">
-            <Skeleton className="to-accent h-full w-full rounded-md bg-gradient-to-tl from-slate-400" />
-          </li>
-        ) : (
-          <motion.li
-            className="bg-accent text-muted-foreground flex w-56 flex-col gap-1.5 rounded-md px-3 py-2 text-sm"
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.15, ease: "easeOut" }}
-          >
-            {/* 标题 + favicon */}
-            <div className="flex items-start gap-2">
-              {docInfo.url && (
-                <FavIcon className="mt-0.5" url={docInfo.url} title={docInfo.title} />
-              )}
-              <a
-                className="line-clamp-2 flex-grow text-xs leading-snug hover:underline"
-                href={docInfo.url ?? undefined}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                {docInfo.title}
-              </a>
-            </div>
+      {SHOW_TOOL_RETURNS && (
+        <ul className="mt-2 flex flex-wrap gap-3">
+          {loading ? (
+            <li className="flex h-24 w-56 rounded-md">
+              <Skeleton className="to-accent h-full w-full rounded-md bg-gradient-to-tl from-slate-400" />
+            </li>
+          ) : (
+            <motion.li
+              className="bg-accent text-muted-foreground flex w-56 flex-col gap-1.5 rounded-md px-3 py-2 text-sm"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.15, ease: "easeOut" }}
+            >
+              {/* 标题 + favicon */}
+              <div className="flex items-start gap-2">
+                {docInfo.url && (
+                  <FavIcon className="mt-0.5" url={docInfo.url} title={docInfo.title} />
+                )}
+                <a
+                  className="line-clamp-2 flex-grow text-xs leading-snug hover:underline"
+                  href={docInfo.url ?? undefined}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {docInfo.title}
+                </a>
+              </div>
 
-            {/* 元信息 */}
-            <div className="text-muted-foreground/60 flex items-center gap-2 text-[11px]">
-              {docInfo.chunkCount > 0 && (
-                <span>{docInfo.chunkCount} 个段落</span>
-              )}
-              {docInfo.isExtracted && (
-                <span className="bg-amber-500/10 text-amber-600 inline-flex items-center gap-0.5 rounded px-1">
-                  <Scissors size={10} />
-                  截取
-                </span>
-              )}
-              {docInfo.fileId && (
-                <span className="text-muted-foreground/40">{docInfo.fileId}</span>
-              )}
-            </div>
-          </motion.li>
-        )}
-      </ul>
+              {/* 元信息 */}
+              <div className="text-muted-foreground/60 flex items-center gap-2 text-[11px]">
+                {docInfo.chunkCount > 0 && (
+                  <span>{docInfo.chunkCount} 个段落</span>
+                )}
+                {docInfo.isExtracted && (
+                  <span className="bg-amber-500/10 text-amber-600 inline-flex items-center gap-0.5 rounded px-1">
+                    <Scissors size={10} />
+                    截取
+                  </span>
+                )}
+                {docInfo.fileId && (
+                  <span className="text-muted-foreground/40">{docInfo.fileId}</span>
+                )}
+              </div>
+            </motion.li>
+          )}
+        </ul>
+      )}
     </section>
   );
 }
