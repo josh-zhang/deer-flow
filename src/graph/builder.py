@@ -1,15 +1,13 @@
 from __future__ import annotations
-
 import logging
 from typing import Literal
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from src.graph.types import State
+from src.graph.planner_model import StepType, Plan
 from src.graph.nodes import (
     analyst_node,
-    arbitrator_node,
     background_investigation_node,
     coordinator_node,
     curator_node,
@@ -19,129 +17,121 @@ from src.graph.nodes import (
     reporter_node,
     researcher_node,
     rule_splitter_node,
+    arbitrator_node,
 )
+from src.graph.types import State
 
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════
-#  Routing Functions
-# ═══════════════════════════════════════════════════════
 
-def route_from_validator(
-    state: State,
-) -> Literal["planner", "researcher", "arbitrator", "analyst"]:
+def route_from_planner(state: State) -> Literal["planner", "researcher", "arbitrator", "analyst"]:
     """
-    plan_validator 出口路由:
+    从 planner 路由: 检查计划是否有效
+    """
+    current_plan = state.get("current_plan")
+    logger.debug(f"route from planner {current_plan}")
 
-    1. _plan_validator_needs_rerun        → planner
-    2. 无有效 plan                        → planner
-    3. 有未完成 research step             → researcher
-    4. 有未完成 analysis step:
-         BI  → arbitrator (走 arbitrator → analyst 路径)
-         CP  → analyst    (跳过 arbitrator)
-    5. fallback: 同 4
-    """
+    if not current_plan:
+        logger.warning("current_plan is None")
+        return "planner"
+    if getattr(current_plan, "steps") is None or not current_plan.steps:
+        return "planner"
+
+    # — layer 1: Override 需要覆盖
+    if hasattr(current_plan, "workflow_type"):
+        planner_type = getattr(current_plan, "workflow_type", state["workflow_type"])
+
+        current_type = state["workflow_type"]
+
+        # 如果声明的类型与 state 中不同, 且 validator 端设置了 override 标志
+        if planner_type != current_type and not state.get("planner_override_occurred", False):
+            # 注意: 此分支理论上不会命中, 因为 plan_validator_node 已在 override 时
+            # 更新了 state["workflow_type"]_. 作为防御性保留.
+            return "planner"
+
+    # — Layer 2: plan_validator 检测到致命数据类型错误需要重建 — 通过设置 workflow_type="A" +
+    # structure_validation_retried=True 来续写
+    # 这里通过一个简单的标志判断
     if state.get("_plan_validator_needs_rerun", False):
         return "planner"
 
-    plan = state.get("current_plan")
-    if plan is None or not getattr(plan, "steps", None):
-        return "planner"
-
     pipeline_mode = state.get("pipeline_mode", "bi")
+
     fallback = "arbitrator" if pipeline_mode == "bi" else "analyst"
 
-    for step in plan.steps:
+    for step in current_plan.steps:
         if not step.execution_res:
             if getattr(step, "step_type", "") == "research":
                 return "researcher"
             elif getattr(step, "step_type", "") == "analysis":
                 return fallback
+            return fallback
 
     return fallback
 
 
-def route_from_curator(
-    state: State,
-) -> Literal["rule_splitter", "researcher", "analyst"]:
+def route_from_splitter(state: State):
     """
-    curator 出口路由:
+    从 Splitter 路由: 控制研究循环, 如果还有下一步, 回 researcher, 否则去 arbitrator
+    """
+    current_plan = state.get("current_plan")
 
-    BI mode → rule_splitter（保持原有链路）
-    CP mode → 跳过 rule_splitter，直接判断下一步:
-        - 有未完成 research step → researcher
-        - 否则                   → analyst
-    """
+    logger.debug(f"route from splitter {current_plan}")
+
+    if not current_plan or not isinstance(current_plan, str):
+        logger.error(f"route from splitter current_plan is None")
+        return "reporter"
+
+    # Find first incomplete step execution_res
+    incomplete_step = None
+    for step in current_plan.steps:
+        if not step.execution_res:
+            incomplete_step = step
+            break
+
+    if incomplete_step is not None and incomplete_step.step_type == StepType.RESEARCH:
+        return "researcher"
+
     pipeline_mode = state.get("pipeline_mode", "bi")
 
     if pipeline_mode == "bi":
-        return "rule_splitter"
-
-    # ── CP mode: skip rule_splitter ──
-    plan = state.get("current_plan")
-    if plan is None or not getattr(plan, "steps", None):
+        return "arbitrator"
+    elif pipeline_mode == "cp":
+        return "analyst"
+    else:
         return "analyst"
 
-    for step in plan.steps:
-        if not step.execution_res and getattr(step, "step_type", "") == "research":
-            return "researcher"
 
-    return "analyst"
-
-
-def route_from_splitter(
-    state: State,
-) -> Literal["researcher", "arbitrator"]:
+def route_from_analyst(state: State):
     """
-    rule_splitter 后路由（仅 BI mode 会到达此节点）:
-    - 有未完成 research step → researcher
-    - 否则                   → arbitrator
+    从 Analyst 路由: 检查是否需要重规划
     """
-    plan = state.get("current_plan")
-    if plan is None or not getattr(plan, "steps", None):
-        return "arbitrator"
+    # 建议在 State 中增加 replan: bool 字段, 由 Analyst 逻辑决定
+    # 如果没有该字段, 也可以通过判断最后一条 observation 是否包含"无法分析"等关键词判断
+    replanning_needed = state.get("replan", False)
 
-    for step in plan.steps:
-        if not step.execution_res:
-            if step.step_type == "research":
-                return "researcher"
-            return "arbitrator"
+    replan_iterations = state.get("replan_iterations", 0)
 
-    return "arbitrator"
+    MAX_ITERATIONS = 2  # 设定最大重规划值
 
+    # 这里已有的重规划次数
+    if replanning_needed and replan_iterations < MAX_ITERATIONS:
+        logger.info(f"[Router] Analyst 发现证据不足, 触发重规划 (replan_iterations + 1) 次重规划.")
+        return "planner"
 
-def route_from_analyst(state: State) -> Literal["reporter", "planner"]:
-    """
-    analyst 后路由（BI / CP 通用）:
-    - replanning_needed=True 且未超限 → planner
-    - 否则                            → reporter
-    """
-    if state.get("replanning_needed", False):
-        replan_it = state.get("replan_iterations", 0)
-        max_replan = state.get("max_replan_iterations", 2)
-        if replan_it < max_replan:
-            logger.info(
-                f"Analyst triggered replan ({replan_it}/{max_replan}). "
-                f"Reason: {state.get('replanning_reason', 'N/A')}"
-            )
-            return "planner"
-        else:
-            logger.warning(
-                "Analyst requested replan but max iterations reached. Forcing report."
-            )
+    if replanning_needed and replan_iterations >= MAX_ITERATIONS:
+        logger.info("[Router] Analyst 达到最大重规划次数, 生成报告(含缺失说明).")
+        return "reporter"
 
+    logger.info("[Router] Analyst 分析完成, 准备生成最终报告.")
     return "reporter"
 
 
-# ═══════════════════════════════════════════════════════
-#  Graph Construction
-# ═══════════════════════════════════════════════════════
-
-def _build_graph() -> StateGraph:
+def build_base_graph() -> StateGraph:
+    """Build and return the base state graph with all nodes and edges."""
+    # — Register Nodes (全部注册, 按 mode 选择性经过) —
     builder = StateGraph(State)
-
-    # ── Register Nodes（全部注册，按 mode 选择性经过）──
     builder.add_node("coordinator", coordinator_node)
     builder.add_node("background_investigator", background_investigation_node)
     builder.add_node("human_feedback", human_feedback_node)
@@ -149,50 +139,40 @@ def _build_graph() -> StateGraph:
     builder.add_node("plan_validator", plan_validator_node)
     builder.add_node("researcher", researcher_node)
     builder.add_node("curator", curator_node)
-    builder.add_node("rule_splitter", rule_splitter_node)   # BI only
-    builder.add_node("arbitrator", arbitrator_node)         # BI only
+    builder.add_node("rule_splitter", rule_splitter_node)
+    builder.add_node("arbitrator", arbitrator_node)  # BI only
     builder.add_node("analyst", analyst_node)
     builder.add_node("reporter", reporter_node)
 
-    # ── Fixed Edges ──
+    # — Fixed Edges —
     builder.add_edge(START, "coordinator")
     builder.add_edge("background_investigator", "planner")
     builder.add_edge("human_feedback", "plan_validator")
     builder.add_edge("researcher", "curator")
-    # ❌ 移除原来的: builder.add_edge("curator", "rule_splitter")
-    builder.add_edge("arbitrator", "analyst")              # BI 路径专用
+    builder.add_edge("curator", "rule_splitter")
+    builder.add_edge("arbitrator", "analyst")  # BI 路径专属
     builder.add_edge("reporter", END)
 
-    # ── Conditional Edges ──
-    builder.add_conditional_edges(
-        "plan_validator",
-        route_from_validator,
-        ["planner", "researcher", "arbitrator", "analyst"],  # 新增 "analyst"
-    )
-    builder.add_conditional_edges(
-        "curator",
-        route_from_curator,                                  # ★ 新增：替代固定边
-        ["rule_splitter", "researcher", "analyst"],
-    )
-    builder.add_conditional_edges(
-        "rule_splitter",
-        route_from_splitter,
-        ["researcher", "arbitrator"],
-    )
-    builder.add_conditional_edges(
-        "analyst",
-        route_from_analyst,
-        ["reporter", "planner"],
-    )
+    # — Conditional Edges —
+    builder.add_conditional_edges("plan_validator", route_from_planner, ["planner", "researcher", "arbitrator", "analyst"])  # route_from_planner
+    builder.add_conditional_edges("rule_splitter", route_from_splitter, ["researcher", "arbitrator", "analyst"])
+    builder.add_conditional_edges("analyst", route_from_analyst, ["reporter", "planner"])
 
     return builder
 
 
-def build_graph():
-    """编译统一 pipeline（无 checkpointer）"""
-    return _build_graph().compile()
-
-
 def build_graph_with_memory():
-    """带内存 checkpointer 的统一 pipeline"""
-    return _build_graph().compile(checkpointer=MemorySaver())
+    """Build and return the agent workflow graph with memory."""
+    # use persistent memory to save conversation history
+    # TODO: be compatible with SQLite / PostgreSQL
+    memory = MemorySaver()
+    # build state graph
+    builder = build_base_graph()
+    return builder.compile(checkpointer=memory)
+
+
+def build_graph():
+    """Build and return the agent workflow graph without checkpointer."""
+    # build state graph
+    builder = build_base_graph()
+    return builder.compile()

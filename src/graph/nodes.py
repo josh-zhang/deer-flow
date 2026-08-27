@@ -1,101 +1,109 @@
-# Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
-# SPDX-License-Identifier: MIT
-
-"""
-V2 调查流水线节点实现。
-
-与 `types.State`、`builder.py` 拓扑对齐：
-coordinator →(Command)→ background → planner →(Command)→ human_feedback → plan_validator
-→ researcher → curator → rule_splitter → … → arbitrator → analyst →(replan|)→ reporter
-"""
-
-from __future__ import annotations
-
+import copy
 import json
 import logging
+import os
 import re
-from functools import partial
 from typing import Annotated, Any, Literal
-from collections import defaultdict
-from pydantic import BaseModel, Field
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+)
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
-from langgraph.graph import END
 from langgraph.types import Command
 
 from src.agents import create_agent
-from src.citations import extract_citations_from_messages, merge_citations
-from src.config.agents import AGENT_LLM_MAP
+from src.config.agents import get_agent_llm_type
 from src.config.configuration import Configuration
-from src.graph.planner_model import Plan
-from src.llms.llm import get_llm_by_type, get_llm_token_limit_by_type
-from src.prompts.template import apply_prompt_template, get_system_prompt_template
-from src.tools import crawl_tool, get_retriever_tool
-from src.utils.context_manager import ContextManager
-from src.utils.json_utils import repair_json_output, sanitize_tool_response
-from src.tools.extractor import ExtractionResult
-from src.graph.curator_parser import extract_citations_from_cache, parse_curator_output
-from src.graph.curator_models import resolve_all_evidence_chunks
-from src.agents.agents import PreModelHookMiddleware
-
-from .ontology import (
+from src.config.report_style import ReportStyle
+from src.graph.curator_parser import (
+    CuratorParseError,
+    extract_citations_from_cache,
+    merge_citations,
+    parse_curator_output,
+)
+from src.graph.curator_views import (
+    build_rule_splitter_view_with_resolved,
+    extract_chunk_maps_from_cache,
+    extract_document_metadata_from_cache,
+    format_citations_for_reporter,
+    format_tool_cache_for_curator,
+    generate_analysis_view,
+    resolve_all_evidence_chunks,
+)
+from src.graph.ontology import (
     extract_ontology_mapping,
+    get_cp_analyzer_template_vars,
     render_arbitrator_bucketing_guide,
+    render_cp_edge_constraints_for_assessor,
+    render_cp_planner_edge_guide,
+    render_element_class_mapping,
     render_planner_guardrail,
     render_skeleton_for_mapper,
 )
-from .curator_views import format_citations_for_reporter, generate_rule_splitter_view
-from .planner_model import Step
-from .types import State
-from .utils import (
+from src.graph.planner_model import Plan, StepType
+from src.graph.types import State
+from src.graph.utils import (
     build_clarified_topic_from_history,
-    format_attached_files_for_prompt,
-    get_latest_user_message,
-    get_message_content,
+    is_user_message,
+    prepare_reporter_input,
     reconstruct_clarification_history,
 )
+from src.llms.llm import get_llm_by_type, get_llm_token_limit_by_type
+from src.prompts.template import apply_prompt_template, get_system_prompt_template
+from src.rag.retriever import format_local_search_return
+from src.tools import (
+    crawl_tool,
+    fetch_tool,
+    get_retriever_tool,
+)
+from src.utils.context_manager import ContextManager, validate_message_content
+from src.utils.json_utils import repair_json_output, sanitize_tool_response
 
 logger = logging.getLogger(__name__)
-
-_RESEARCHER_TAG = "[researcher]"
-_CURATOR_TAG = "[curator]"
-_RULE_DONE = "[规则拆分已完成]"
-
-
-# ── Coordinator 工具（与 coordinator.zh_CN.md 一致）────────────────────────
 
 
 @tool
 def handoff_to_planner(
-    research_topic: Annotated[str, "银行信用卡客户需求原文及澄清摘要。"],
-    locale: Annotated[str, "用户语言区域，如 zh_CN。"],
-    workflow_type: Annotated[str, "工作流类型：A / B / C / D。"],
-    workflow_confidence: Annotated[str, "high / medium / low。"],
+    research_topic: Annotated[str, "The topic of the research task to be handed off."],
+    workflow_type: Annotated[str, "The workflow_type of the research task to be handed off."],
+    workflow_confidence: Annotated[str, "The confidence of the workflow_type."],
 ):
-    """将已明确的客户需求交给规划专家。"""
-    return "ok"
+    """Handoff to planner agent to do plan."""
+    # This tool is not returning anything: we're just using it
+    # as a way for LLM to signal that it needs to hand off to planner agent
+    logger.info(f"handoff_to_planner research_topic ({research_topic})")
+    return
 
 
 @tool
 def handoff_after_clarification(
-    locale: Annotated[str, "用户语言区域，如 zh_CN。"],
-    research_topic: Annotated[str, "澄清后的完整客户需求表述。"],
-    workflow_type: Annotated[str, "工作流类型：A / B / C / D。"],
-    workflow_confidence: Annotated[str, "high / medium / low。"],
+    research_topic: Annotated[
+        str, "The clarified research topic based on all clarification rounds."
+    ],
+    workflow_type: Annotated[str, "The workflow_type of the research task to be handed off."],
+    workflow_confidence: Annotated[str, "The confidence of the workflow_type."],
 ):
-    """澄清结束后交给规划专家。"""
-    return "ok"
+    """Handoff to planner after clarification rounds are complete. Pass all clarification history to planner for analysis."""
+    logger.info(f"handoff_after_clarification research_topic ({research_topic})")
+    return
 
 
 def needs_clarification(state: dict) -> bool:
+    """
+    Check if clarification is needed based on current state.
+    Centralized logic for determining when to continue clarification.
+    """
     if not state.get("enable_clarification", False):
         return False
     clarification_rounds = state.get("clarification_rounds", 0)
     is_clarification_complete = state.get("is_clarification_complete", False)
-    max_clarification_rounds = state.get("max_clarification_rounds", 3)
+    max_clarification_rounds = state.get("max_clarification_rounds", 2)
+    # Need clarification if: enabled + has rounds + not complete + not exceeded max
+    # Use <= because after asking the Nth question, we still need to wait for the Nth answer
     return (
         clarification_rounds > 0
         and not is_clarification_complete
@@ -104,111 +112,1927 @@ def needs_clarification(state: dict) -> bool:
 
 
 def preserve_state_meta_fields(state: State) -> dict:
-    """在 Command.update 中显式带回，避免被默认值覆盖。"""
+    """
+    Extract meta/config fields that should be preserved across state transitions.
+    These fields are critical for workflow continuity and should be explicitly
+    included in all Command.update dicts to prevent them from reverting to defaults.
+
+    Args:
+        state: Current state object
+
+    Returns:
+        Dict of meta fields to preserve
+    """
     return {
-        "locale": state.get("locale", "zh_CN"),
+        "locale": state.get("locale", "zh-CN"),
         "research_topic": state.get("research_topic", ""),
         "original_topic": state.get("original_topic", ""),
         "clarified_research_topic": state.get("clarified_research_topic", ""),
         "clarification_history": state.get("clarification_history", []),
         "enable_clarification": state.get("enable_clarification", False),
-        "max_clarification_rounds": state.get("max_clarification_rounds", 3),
+        "max_clarification_rounds": state.get("max_clarification_rounds", 2),
         "clarification_rounds": state.get("clarification_rounds", 0),
         "resources": state.get("resources", []),
-        "enable_background_investigation": state.get("enable_background_investigation", True),
-        "auto_accepted_plan": state.get("auto_accepted_plan", False),
-        "max_plan_iterations": state.get("max_plan_iterations", 3),
+        "workflow_type": state.get("workflow_type", ""),
+        "workflow_confidence": state.get("workflow_confidence", ""),
+        "missing_conditions": state.get("missing_conditions", []),
+        "pipeline_mode": state.get("pipeline_mode", ""),
     }
 
 
-def _plan_steps(plan: Plan | None) -> list:
-    if plan is None:
-        return []
-    return list(getattr(plan, "steps", None) or [])
+def validate_and_fix_plan(plan: dict) -> dict:
+    """
+    Validate and fix a plan to ensure it meets requirements.
 
+    Args:
+        plan: The plan dict to validate
 
-def _first_pending_step_by_type(plan: Plan | None, step_type: str):
-    for step in _plan_steps(plan):
-        if getattr(step, "step_type", "") != step_type:
+    Returns:
+        The validated/fixed plan dict
+    """
+    if not isinstance(plan, dict):
+        return plan
+
+    steps = plan.get("steps", [])
+
+    # =========================================================================
+    # SECTION 1: Repair missing step_type fields (Issue #650 fix)
+    # =========================================================================
+    for idx, step in enumerate(steps):
+        if not isinstance(step, dict):
             continue
-        if not (step.execution_res or "").strip():
-            return step
-    return None
+
+        # Check if step_type is missing or empty
+        if "step_type" not in step or not step.get("step_type"):
+            # Infer step_type based on need_search value
+            # Default to "analysis" for non-search steps (Issue #677: not all processing needs code)
+            inferred_type = "research" if step.get("need_search", False) else "analysis"
+            step["step_type"] = inferred_type
+            logger.info(
+                f"Repaired missing step_type for step {idx} ({step.get('title', 'Untitled')}): "
+                f"inferred as '{inferred_type}' based on need_search={step.get('need_search', False)}"
+            )
+
+    check_last_step_is_analysis = False
+    last_step = steps[-1] if steps else {}
+    if isinstance(last_step, dict):
+        step_type = last_step.get("step_type")
+        if step_type == "analysis":
+            check_last_step_is_analysis = True
+
+    if not check_last_step_is_analysis:
+        return {}
+    return plan
 
 
-def _research_steps(plan: Plan | None) -> list:
-    return [s for s in _plan_steps(plan) if getattr(s, "step_type", "") == "research"]
+async def _run_cp_analyzer(state: State, config: RunnableConfig, configurable: Configuration) -> dict:
+    """CP 模式：通过调用 CP/analyzer.md 分析宣传文本。"""
+    query = state.get("original_topic")
+    logger.info(f"[background_investigation_node] search query: {query}")
+    max_search_results = 10
+    agent_type = "background_investigator"
+    background_investigator = create_agent(
+        agent_type,
+        config,
+        [],
+    )
+    agent_input = {
+        "messages": [
+            HumanMessage(
+                content=f"# 信用卡业务宣传文本\n\n{query}",
+                name="user",
+            )
+        ]
+    }
+    sub: dict = {
+        **state,
+        **get_cp_analyzer_template_vars(),
+    }
+    response_content = await get_response(background_investigator, sub, agent_input, agent_type, configurable)
+    if response_content is not None and response_content:
+        logger.debug(f"background_investigator response_content {response_content}")
+        retriever_tool = get_retriever_tool(
+            max_search_results,
+            configurable.report_style,
+            state.get("resources", []),
+        )
+        documents = retriever_tool.retriever.query_relevant_documents(
+            query, max_search_results, "", retriever_tool.resources
+        )
+        background_investigation_results, _ = format_local_search_return(documents)
+        bi_result = {
+            "background_investigation": background_investigation_results,
+            "review_scope": response_content,
+        }
+        return {
+            "background_investigation_results": json.dumps(
+                bi_result,
+                ensure_ascii=False,
+            ),
+            "kb_panorama": "",
+            **preserve_state_meta_fields(state),
+        }
+    else:
+        logger.warning(f"cp_background_investigator return empty result {response_content}")
+        return Command(
+            update=preserve_state_meta_fields(state),
+            goto="__end__",
+        )
 
 
-def _generate_searcher_summary(
-    step_title: str, step_description: str, parsed: dict[str, Any]
-) -> str:
-    covered = parsed.get("coverage") if isinstance(parsed, dict) else ""
-    return (
-        f"### {step_title}\n"
-        f"- 检索内容：{step_description}\n"
-        f"- 覆盖度：{covered or '（未提供）'}"
+async def _run_bi_bgi_and_mapper(
+    state: State,
+    config: RunnableConfig,
+    configurable: Configuration,
+) -> dict:
+    """BI 模式: BGI 多角度 KB 探索 + Ontology Mapper 双阶段。"""
+    query = state.get("original_topic")
+    logger.info(f"[background_investigation_node] search query: {query}")
+    max_search_results = 20
+    logger.info(f"[background_investigation_node] Max search results: {max_search_results}")
+
+    # Build tools list based on configuration
+    # Add retriever tool if resources are available (always add, higher priority)
+    retriever_tool = get_retriever_tool(
+        max_search_results,
+        configurable.report_style,
+        state.get("resources", []),
+    )
+    if retriever_tool:
+        logger.debug(f"[background_investigation_node] Adding retriever tool to tools list")
+    else:
+        return Command(
+            update=preserve_state_meta_fields(state),
+            goto="__end__",
+        )
+    tools = [retriever_tool]
+    # logger.info(f"[background_investigation_node] Researcher tools count: {len(tools)}")
+    logger.debug(
+        f"[background_investigation_node] Researcher tools: {[tool.name if hasattr(tool, 'name') else str(tool) for tool in tools]}"
+    )
+    agent_type = "background_investigator"
+    background_investigator = create_agent(
+        agent_type,
+        config,
+        tools,
+    )
+    agent_input = {
+        "messages": [
+            HumanMessage(
+                content=f"# 用户问题\n\n{query}",
+                name="user",
+            )
+        ]
+    }
+    kb_panorama = await get_response(background_investigator, state, agent_input, agent_type, configurable)
+    if kb_panorama is not None and kb_panorama:
+        logger.debug(f"background_investigator kb_panorama {kb_panorama}")
+        # —— 本体映射 LLM 调用 ——
+        mapper_human = f"## 用户问题\n{query}\n\n"
+        if kb_panorama:
+            mapper_human += f"{kb_panorama[:4000]}\n"
+        mapper_sub = {
+            **state,
+            "ontology_skeleton": render_skeleton_for_mapper(),
+            "messages": [HumanMessage(content=mapper_human, name="user")],
+        }
+        # if not configurable.enable_deep_thinking:
+        #     llm_type = "lite_reasoning"
+        # else:
+        #     llm_type = "reasoning"
+        try:
+            mapper_llm = get_llm_by_type(llm_type)
+            mapper_content = str(
+                (
+                    await mapper_llm.ainvoke(
+                        apply_prompt_template("ontology_mapper", mapper_sub, configurable)
+                    )
+                ).content
+                or ""
+            )
+            mapping = extract_ontology_mapping(mapper_content)
+        except Exception as e:
+            logger.warning("ontology_mapper llm failed: %s", e)
+            mapping = ""
+        if mapping:
+            payload_str = mapping
+        else:
+            logger.warning("ontology_mapper: no valid <ontology_mapping>, fallback to raw KB payload")
+            payload_str = json.dumps(
+                [{"query": query, "summary": kb_panorama}] if kb_panorama else [],
+                ensure_ascii=False,
+            )
+        return {
+            "background_investigation_results": payload_str,
+            "kb_panorama": kb_panorama,
+            **preserve_state_meta_fields(state),
+        }
+    else:
+        logger.warning(f"background_investigator return empty result {kb_panorama}")
+        return Command(
+            update=preserve_state_meta_fields(state),
+            goto="__end__",
+        )
+
+
+async def background_investigation_node(state: State, config: RunnableConfig):
+    """Ontology Mapper + KB 概要双通道输出 (P1 改造 + 修正，2026-06-10)。
+    产出两份独立结果:
+    1. background_investigation_results: 本体映射 (Ontology Mapping) XML (结构护栏)
+    2. kb_panorama: KB 轻量检索概要 (长尾信息参考 + KB 准确名称权威来源)
+    Planner 同时消费两份输入: 本体边=必查维度硬性下限, KB 概要=长尾覆盖 + 名称校准。
+    降级路径: LLM 映射失败时本体映射回退为空, KB 概要仍正常下发。
+    """
+    if not state.get("enable_background_investigation", True):
+        return {}
+    logger.info("background investigation node is running.")
+    configurable = Configuration.from_runnable_config(config)
+    report_style = configurable.report_style
+    if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+        return await _run_bi_bgi_and_mapper(state, config, configurable)
+    elif report_style == ReportStyle.CUSTOMER_RIGHTS_PROTECTION_REVIEW.value:
+        return await _run_cp_analyzer(state, config, configurable)
+    else:
+        return {}
+
+
+def planner_node(state: State, config: RunnableConfig) -> Command[Literal["human_feedback", "reporter"]]:
+    """Planner node that generate the full plan."""
+    logger.info("Planner generating full plan with locale: %s", state.get("locale", "zh-CN"))
+    configurable = Configuration.from_runnable_config(config)
+    plan_iterations = state.get("plan_iterations", 0)
+    # if the plan iterations is greater than the max plan iterations, return the reporter node
+    if plan_iterations >= configurable.max_plan_iterations:
+        logger.warning(
+            f"plan_iterations {plan_iterations} exceed max_plan_iterations {configurable.max_plan_iterations}"
+        )
+        return Command(
+            update=preserve_state_meta_fields(state),
+            goto="reporter",
+        )
+    logger.info(f"plan_iterations {plan_iterations} max_plan_iterations {configurable.max_plan_iterations}")
+    workflow_type = state["workflow_type"]
+    confidence = state.get("workflow_confidence", "high")
+    is_override_retry = state.get("planner_override_occurred", False)
+    is_validation_retry = state.get("structure_validation_retried", False)
+
+    # —— Layer 0: 低置信度降级为静态全量 Prompt ——
+    if confidence == "low" and not is_override_retry and not is_validation_retry:
+        logger.info("Planner: Low confidence -> using static full prompt (all 4 workflows)")
+        state["workflow_type"] = "A"
+    prompt_key = "planner"
+    report_style = configurable.report_style
+    if report_style == ReportStyle.CUSTOMER_RIGHTS_PROTECTION_REVIEW.value:
+        state = {
+            **state,
+            "cp_planner_edge_guide": render_cp_planner_edge_guide(),
+        }
+    # For clarification feature: use the clarified research topic (complete history)
+    if state.get("enable_clarification", False) and state.get("clarified_research_topic"):
+        # Modify state to use clarified research topic instead of full conversation
+        modified_state = copy.deepcopy(state)
+        modified_state["messages"] = [
+            {"role": "user", "content": state["clarified_research_topic"]}
+        ]
+        modified_state["research_topic"] = state["clarified_research_topic"]
+        messages = apply_prompt_template(prompt_key, modified_state, configurable)
+        logger.info(
+            f"Clarification mode: Using clarified research topic: {state['clarified_research_topic']}"
+        )
+    else:
+        # Normal mode: use full conversation history
+        messages = apply_prompt_template(prompt_key, state, configurable)
+
+    if state.get("enable_background_investigation") and state.get("background_investigation_results"):
+        if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+            background_investigation_results_str = state["background_investigation_results"]
+            if background_investigation_results_str:
+                # P1 (2026-06-10) : 上游为 Ontology Mapper 时注入本体约束护栏 (Constraint Injection) :
+                # 上游降级输出原始检索 payload 时回退旧版"背景调查参考"格式。
+                guardrail = render_planner_guardrail(background_investigation_results_str)
+                if guardrail:
+                    messages += [
+                        {
+                            "role": "user",
+                            "content": (
+                                "# 本体映射结果 (Ontology Mapping) \n"
+                                + extract_ontology_mapping(background_investigation_results_str)
+                                + "\n\n"
+                                + guardrail
+                            ),
+                        }
+                    ]
+            kb_panorama = state["kb_panorama"]
+            if kb_panorama.strip():
+                messages += [
+                    {
+                        "role": "user",
+                        "content": kb_panorama,
+                    }
+                ]
+        elif report_style == ReportStyle.CUSTOMER_RIGHTS_PROTECTION_REVIEW.value:
+            background_investigation_results = json.loads(state["background_investigation_results"])
+            review_scope = background_investigation_results["review_scope"]
+            messages += [
+                {
+                    "role": "user",
+                    "content": f"# 审查范围分析结果\n\n{review_scope}",
+                }
+            ]
+            background_investigation_results_str = background_investigation_results["background_investigation"]
+            if background_investigation_results_str:
+                messages += [
+                    {
+                        "role": "user",
+                        "content": f"# 相关消保审查参考信息\n\n{background_investigation_results_str}",
+                    }
+                ]
+        else:
+            background_investigation_results_str = state["background_investigation_results"]
+            if background_investigation_results_str:
+                messages += [
+                    {
+                        "role": "user",
+                        "content": f"# 相关业务参考信息\n\n{background_investigation_results_str}",
+                    }
+                ]
+
+    if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+        replan_iterations = state.get("replan_iterations", 0)
+        is_replan = state.get("replan", False)
+        if replan_iterations > 0 and is_replan:
+            replanning_reason = state.get("replan_reason")
+            last_plan = state.get("last_plan")
+            if replanning_reason and last_plan:
+                messages += [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"**注意：当前处于重规划阶段。**按照下方“重规划反馈”，对“上一轮计划”进行针对性调整，并重新制定调查计划。\n\n"
+                            f"# 上一轮计划\n\n{last_plan}\n\n# 重规划反馈\n\n{replanning_reason}"
+                        ),
+                    }
+                ]
+
+    # Override 重试：附加说明
+    if is_override_retry:
+        messages += [
+            {
+                "role": "user",
+                "content": (
+                    f"你在上一次输出中将 workflow_type 修改为 {workflow_type}，"
+                    "本次已使用该类型的策略模板。请基于此策略重新制定计划。"
+                ),
+            }
+        ]
+    # 结构校验重试：降级说明
+    if is_validation_retry:
+        messages += [
+            {
+                "role": "user",
+                "content": (
+                    "上一次生成的计划未通过结构校验，已降级为工作流 A（定点调查）。"
+                    "请按照定点调查策略重新制定计划。"
+                ),
+            }
+        ]
+
+    llm_type = get_agent_llm_type("planner", configurable.enable_deep_thinking)
+    llm = get_llm_by_type(llm_type)
+    logger.debug(f"Planner inputs {messages}")
+    response = llm.stream(messages)
+    full_response = ""
+    for chunk in response:
+        full_response += chunk.content
+    logger.debug(f"Planner full_response {full_response}")
+    full_response = full_response.strip()
+    logger.debug(f"Current state messages: {state['messages']}")
+
+    # Clean the response first to handle markdown code blocks (```json, ```ts, etc.)
+    cleaned_response = repair_json_output(full_response)
+    # Validate explicitly that response content is valid JSON before proceeding to parse it
+    if not cleaned_response.strip().startswith("{") and not cleaned_response.strip().startswith("["):
+        logger.warning("Planner response does not appear to be valid JSON after cleanup")
+        if plan_iterations > 0:
+            return Command(
+                update=preserve_state_meta_fields(state),
+                goto="reporter",
+            )
+        else:
+            return Command(
+                update=preserve_state_meta_fields(state),
+                goto="__end__",
+            )
+    try:
+        curr_plan = json.loads(cleaned_response)
+        # Need to extract the plan from the full_response
+        curr_plan_content = extract_plan_content(curr_plan)
+        # Load the current_plan
+        curr_plan = json.loads(repair_json_output(curr_plan_content))
+        # full_response = f"```json\n{json.dumps(curr_plan, ensure_ascii=False)}\n```"
+    except json.JSONDecodeError:
+        logger.error("Planner response is not a valid JSON")
+        if plan_iterations > 0:
+            return Command(
+                update=preserve_state_meta_fields(state),
+                goto="reporter",
+            )
+        else:
+            return Command(
+                update=preserve_state_meta_fields(state),
+                goto="__end__",
+            )
+    logger.debug(f"Planner full_response final {full_response}")
+    return Command(
+        update={
+            "messages": [AIMessage(content=full_response, name="planner")],
+            "current_plan": full_response,
+            "_plan_validator_needs_rerun": False,  # 重置路由信号
+            **preserve_state_meta_fields(state),
+        },
+        goto="human_feedback",
     )
 
 
-def _first_research_step_pending_researcher(plan: Plan | None):
-    return _first_pending_step_by_type(plan, "research")
+def _serialize_plan(plan) -> str:
+    """将 Plan 对象序列化为 JSON 字符串，用于 Replan 时传递给 Planner。"""
+    if plan is None:
+        return "{}"
+    if hasattr(plan, "model_dump"):
+        return json.dumps(plan.model_dump(), ensure_ascii=False, indent=2)
+    if hasattr(plan, "__dict__"):
+        return json.dumps(plan.__dict__, ensure_ascii=False, indent=2, default=str)
+    return str(plan)
 
 
-def _first_analysis_step_pending_analyst(plan: Plan | None):
-    return _first_pending_step_by_type(plan, "analysis")
+def extract_plan_content(plan_data: str | dict | Any) -> str:
+    """
+    Safely extract plan content from different types of plan data.
+
+    Args:
+        plan_data: The plan data which can be a string, AIMessage, or dict
+
+    Returns:
+        str: The plan content as a string (JSON string for dict inputs, or extracted/original string for other types)
+    """
+    if isinstance(plan_data, str):
+        # If it's already a string, return as is
+        return plan_data
+    elif hasattr(plan_data, "content") and isinstance(plan_data.content, str):
+        # If it's an AIMessage or similar object with a content attribute
+        logger.debug(f"Extracting plan content from message object of type {type(plan_data).__name__}")
+        return plan_data.content
+    elif isinstance(plan_data, dict):
+        # If it's already a dictionary, convert to JSON string
+        # Need to check if it's dict with content field (AIMessage-like)
+        if "content" in plan_data:
+            if isinstance(plan_data["content"], str):
+                logger.debug("Extracting plan content from dict with content field")
+                return plan_data["content"]
+            if isinstance(plan_data["content"], dict):
+                logger.debug("Converting content field dict to JSON string")
+                return json.dumps(plan_data["content"], ensure_ascii=False)
+            if isinstance(plan_data["content"], list):
+                # Handle multimodal message format where content is a list
+                # Extract text content from the list structure
+                logger.debug(
+                    f"Extracting plan content from multimodal list format with {len(plan_data['content'])} elements"
+                )
+                for item in plan_data["content"]:
+                    if isinstance(item, str) and item.strip():
+                        # Return the first valid text content found
+                        # We only take the first one because plan content should be a single JSON object
+                        # Joining multiple text parts with newlines would produce invalid JSON
+                        return item
+                    elif isinstance(item, dict):
+                        # Handle content block format like {"type": "text", "text": "..."}
+                        if item.get("type") == "text" and "text" in item:
+                            return item["text"]
+                        elif "content" in item and isinstance(item["content"], str):
+                            return item["content"]
+                # No valid text content found - raise ValueError to trigger error handling
+                # DO NOT use json.dumps() here as it would produce a JSON array that causes
+                # Plan.model_validate() to fail with ValidationError (issue #845)
+                raise ValueError(f"No valid text content found in multimodal list: {plan_data['content']}")
+            else:
+                logger.warning(
+                    f"Unexpected type for 'content' field in plan_data dict: {type(plan_data['content']).__name__}, converting to string"
+                )
+                return str(plan_data["content"])
+        else:
+            logger.debug("Converting plan dictionary to JSON string")
+            return json.dumps(plan_data, ensure_ascii=False)
+    else:
+        # For any other type, try to convert to string
+        logger.warning(
+            f"Unexpected plan data type {type(plan_data).__name__}, attempting to convert to string"
+        )
+        return str(plan_data)
 
 
-def _first_research_step_pending_curator(plan: Plan | None):
-    for step in _plan_steps(plan):
-        if getattr(step, "step_type", "") != "research":
-            continue
-        er = (step.execution_res or "").lstrip()
-        if not er:
-            continue
-        if _RULE_DONE in (step.execution_res or ""):
-            continue
-        if er.startswith(_CURATOR_TAG):
-            continue
-        if er.startswith(_RESEARCHER_TAG):
-            return step
-    return None
-
-
-def _first_research_step_pending_rule_splitter(plan: Plan | None):
-    for step in _plan_steps(plan):
-        if getattr(step, "step_type", "") != "research":
-            continue
-        er = (step.execution_res or "").lstrip()
-        if _RULE_DONE in (step.execution_res or ""):
-            continue
-        if er.startswith(_CURATOR_TAG):
-            return step
-    return None
-
-
-def _extract_tool_payloads_from_messages(messages: list[Any]) -> str:
-    parts: list[str] = []
-    n = 0
-    for m in messages or []:
-        if isinstance(m, ToolMessage):
-            n += 1
-            name = m.name or "tool"
-            parts.append(f"### {name}_{n}\n{sanitize_tool_response(str(m.content))}")
-        elif isinstance(m, dict) and (m.get("role") or "").lower() == "tool":
-            n += 1
-            parts.append(
-                f"### {m.get('name', 'tool')}_{n}\n"
-                f"{sanitize_tool_response(str(m.get('content', '')))}"
+def human_feedback_node(
+    state: State, config: RunnableConfig
+) -> Command[Literal["plan_validator"]]:
+    current_plan = state.get("current_plan", "")
+    # If the plan is accepted, run the following node
+    plan_iterations = state.get("plan_iterations", 0)
+    original_plan = current_plan
+    try:
+        # Safely extract plan content from different types (string, AIMessage, dict)
+        # Repair the JSON output
+        current_plan = repair_json_output(current_plan)
+        # parse the plan to dict
+        current_plan = json.loads(current_plan)
+        current_plan_content = extract_plan_content(current_plan)
+        # increment the plan iterations
+        plan_iterations += 1
+        # parse the plan
+        new_plan = json.loads(repair_json_output(current_plan_content))
+        new_plan = validate_and_fix_plan(new_plan)
+    except (json.JSONDecodeError, AttributeError) as e:
+        logger.error(f"Failed to parse plan: {str(e)}. Plan data type: {type(current_plan).__name__}")
+        if isinstance(current_plan, dict) and "content" in original_plan:
+            logger.warning(f"Plan appears to be an AIMessage object with content field")
+        if plan_iterations > 1:
+            # The plan_iterations is increased before this check
+            return Command(
+                update=preserve_state_meta_fields(state),
+                goto="reporter",
             )
-    return "\n\n".join(parts) if parts else "（本轮无工具返回）"
+        else:
+            return Command(
+                update=preserve_state_meta_fields(state),
+                goto="__end__",
+            )
+    if not new_plan:
+        logger.error(f"new_plan last step is not analyst {new_plan}. Returning to planner for new plan.")
+        return Command(
+            update=preserve_state_meta_fields(state),
+            goto="planner",
+        )
+    logger.debug(f"human_feedback plan {new_plan}")
+    current_plan = Plan.model_validate(new_plan)
+    # Build update dict with safe locale handling
+    update_dict = {
+        "current_plan": current_plan,
+        # "last_plan": new_plan,
+        "plan_iterations": plan_iterations,
+        **preserve_state_meta_fields(state),
+    }
+    # Only override locale if new_plan provides a valid value, otherwise use preserved locale
+    if new_plan.get("locale"):
+        update_dict["locale"] = new_plan["locale"]
+    return Command(
+        update=update_dict,
+        goto="plan_validator",
+    )
 
 
-def _last_ai_message(messages: list[Any]) -> AIMessage | None:
-    for m in reversed(messages or []):
-        if isinstance(m, AIMessage):
-            return m
-    return None
+def plan_validator_node(state: State) -> dict:
+    """
+    Layer 1 (Override 检测) + Layer 2 (结构校验)
+    职责:
+    1. 检查 Planner 输出的 workflow_type 是否与 state 一致 (Override 检测)
+    2. 校验 Plan 结构是否符合声称的 workflow_type
+    3. 通过 _plan_validator_needs_rerun 信号通知路由函数
+    """
+    plan = state.get("current_plan")
+    if plan is None:
+        logger.error("plan_validator: current_plan is None")
+        return {"_plan_validator_needs_rerun": False}
+
+    current_wf = state["workflow_type"]
+    override_occurred = state.get("planner_override_occurred", False)
+    validation_retried = state.get("structure_validation_retried", False)
+    plan_str = _serialize_plan(plan)
+
+    # -- Layer 1: Override Detection --
+    planner_declared_type = getattr(plan, "workflow_type", "")
+    logger.info(f"planner_declared_type: {planner_declared_type} current_wf {current_wf}")
+    if planner_declared_type != current_wf and not override_occurred:
+        logger.warning(
+            f"Plan Validator [Layer 1]: Planner override detected '({current_wf}) -> {planner_declared_type}'. "
+            f"Re-rendering with new type and rerunning Planner."
+        )
+        state["workflow_type"] = planner_declared_type
+        state["workflow_confidence"] = "high"  # Planner 自行判断，视为高置信
+        # Build update dict with safe locale handling
+        return {
+            "planner_override_occurred": True,
+            "_plan_validator_needs_rerun": True,
+            "last_plan": plan_str,
+            **preserve_state_meta_fields(state),
+        }
+
+    # -- Layer 2: Structure Validation --
+    is_valid, error_msg = validate_plan_structure(plan, current_wf)
+    if not is_valid and not validation_retried:
+        logger.warning(
+            f"Plan Validator [Layer 2]: Structure validation failed - {error_msg}. "
+            f"Downgrading to workflow A and rerunning Planner."
+        )
+        state["workflow_type"] = "A"
+        return {
+            "structure_validation_retried": True,
+            "_plan_validator_needs_rerun": True,
+            "last_plan": plan_str,
+            **preserve_state_meta_fields(state),
+        }
+
+    if not is_valid and validation_retried:
+        logger.warning(
+            f"Plan Validator [Layer 2]: Structure still invalid after retry - {error_msg}. "
+            f"Proceeding anyway."
+        )
+
+    # -- All Checks Passed --
+    logger.info("Plan Validator: All checks passed.")
+    return {
+        "_plan_validator_needs_rerun": False,
+        "last_plan": plan_str,
+        **preserve_state_meta_fields(state),
+    }
+
+
+def validate_plan_structure(plan: Any, workflow_type: str) -> tuple[bool, str]:
+    """纯代码校验 Plan 结构是否符合声称的 workflow_type。不做语义判断，只检查结构指标。
+    Returns: (is_valid, error_message)
+    """
+
+    def _extract_targets_from_description(description: str) -> list[str]:
+        """
+        从 Step description 中按分号拆分出标的列表。
+        示例: "'中信银行白金卡'的年费标准;年费减免条件;年费收取时间" -> ['年费标准', '年费减免条件', '年费收取时间']
+        """
+        if not description:
+            return []
+        # 尝试用中文分号分割
+        parts = re.split(r"[;；]", description)
+        # 清理:去除首段 (通常是实体+业务名,不是标的)
+        targets = []
+        for part in parts:
+            part = part.strip().rstrip(".")
+            if part:
+                targets.append(part)
+        return targets
+
+    if plan is None:
+        return False, "Plan is None"
+
+    steps = getattr(plan, "steps", [])
+    research_steps = [s for s in steps if getattr(s, "step_type", "") == "research"]
+    analysis_steps = [s for s in steps if getattr(s, "step_type", "") == "analysis"]
+
+    # -- 通用校验 --
+    if not steps:
+        return False, "Plan has no steps"
+    if not analysis_steps:
+        return False, "Plan missing analysis step"
+    if getattr(analysis_steps[-1], "step_type", "") != "analysis":
+        return False, "Last step is not analysis"
+    if not research_steps:
+        return False, "Plan has no research steps"
+
+    # -- 工作流 B 校验: ≥2 research step, 维度对齐
+    if workflow_type == "B":
+        if len(research_steps) < 2:
+            return False, f"Workflow B requires ≥2 research steps, got {len(research_steps)}"
+        # 检查维度清单是否结构标一致 (标的数量相同)
+        target_counts = []
+        for s in research_steps:
+            desc = getattr(s, "description", "")
+            targets = _extract_targets_from_description(desc)
+            target_counts.append(len(targets))
+        if len(set(target_counts)) > 1:
+            logger.warning(
+                f"Workflow B: dimension counts not aligned across research steps: {target_counts}"
+            )
+
+    # -- 工作流 C 校验: ≥2 不同角度的 research step --
+    elif workflow_type == "C":
+        if len(research_steps) < 2:
+            return False, f"Workflow C requires ≥2 scan angles, got {len(research_steps)}"
+
+    # -- 工作流 D 校验: 有否定条款检索 step --
+    elif workflow_type == "D":
+        negative_keywords = ["例外", "禁止", "不适用", "不予", "除外", "限制"]
+        has_negative_step = any(
+            any(kw in getattr(s, "description", "") for kw in negative_keywords)
+            for s in research_steps
+        )
+        if not has_negative_step:
+            logger.warning("Workflow D: missing negative/exception clause search step")
+        # missing_conditions 空值为 soft warning (用户可能提供了全部条件)
+        missing = getattr(plan, "missing_conditions", [])
+        if not missing:
+            logger.warning(
+                "Workflow D: missing_conditions is empty. "
+                "This may be correct if user provided all conditions."
+            )
+
+    return True, ""
+
+
+def coordinator_node(
+    state: State, config: RunnableConfig
+) -> Command[Literal["planner", "background_investigator", "coordinator", "__end__"]]:
+    """Coordinator node that communicate with customers and handle clarification."""
+    logger.info("Coordinator talking.")
+    configurable = Configuration.from_runnable_config(config)
+    report_style = configurable.report_style
+    if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+        pipeline_mode = "bi"
+    elif report_style == ReportStyle.CUSTOMER_RIGHTS_PROTECTION_REVIEW.value:
+        pipeline_mode = "cp"
+    else:
+        pipeline_mode = "unkonw"
+
+    # Check if clarification is enabled
+    enable_clarification = state.get("enable_clarification", False)
+    initial_topic = state.get("research_topic", "")
+    original_topic = state.get("original_topic", "")
+    # clarified topic initial_topic
+    workflow_type = state.get("workflow_type", "")
+    workflow_confidence = state.get("workflow_confidence", "")
+    logger.info(
+        f"Coordinator talking. enable_clarification {enable_clarification}\n initial_topic {initial_topic}\noriginal_topic {original_topic}"
+    )
+
+    # =================================================================
+    # BRANCH 1: Clarification DISABLED (Legacy Mode)
+    # =================================================================
+    if not enable_clarification:
+        # Use normal prompt with explicit instruction to skip clarification
+        sub = {
+            **state,
+            "enable_clarification": False,
+        }
+        messages = apply_prompt_template("coordinator", sub, configurable)
+        # Bind both handoff_to_planner and direct_response tools
+        tools = [handoff_to_planner]
+        llm_type = get_agent_llm_type("coordinator", configurable.enable_deep_thinking)
+        response = (
+            get_llm_by_type(llm_type)
+            .bind_tools(tools)
+            .invoke(messages)
+        )
+        goto = "__end__"
+        locale = state.get("locale", "zh-CN")
+        # logger.info(f"Coordinator locale: {locale}")
+        research_topic = state.get("research_topic", "")
+
+        # Process tool calls for legacy mode
+        if response.tool_calls:
+            try:
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call.get("name", "")
+                    tool_args = tool_call.get("args", {})
+                    if tool_name == "handoff_to_planner":
+                        logger.info("Handing off to planner")
+                        goto = "planner"
+                        # Extract research_topic if provided
+                        if tool_args.get("research_topic"):
+                            research_topic = tool_args.get("research_topic")
+                        if tool_args.get("workflow_type"):
+                            workflow_type = tool_args.get("workflow_type")
+                        if tool_args.get("workflow_confidence"):
+                            workflow_confidence = tool_args.get("workflow_confidence")
+                        break
+            except Exception as e:
+                logger.error(f"Error processing tool calls: {e}")
+                goto = "planner"
+        # Do not return early - let code flow to unified return logic below
+        # Set clarification variables for legacy mode
+        clarification_rounds = 0
+        clarification_history = []
+        clarified_topic = research_topic
+
+    # ------------------------------------------------
+    # BRANCH 2: Clarification ENABLED (New Feature)
+    # ------------------------------------------------
+    else:
+        # Load clarification state
+        clarification_rounds = state.get("clarification_rounds", 0)
+        clarification_history = list(state.get("clarification_history", [])) or []
+        clarification_history = [item for item in clarification_history if item]
+        max_clarification_rounds = state.get("max_clarification_rounds", 2)
+
+        # Prepare the messages for the coordinator
+        state_messages = list(state.get("messages", []))
+        sub = {
+            **state,
+            "enable_clarification": True,
+        }
+        messages = apply_prompt_template("coordinator", sub, configurable)
+        clarification_history = reconstruct_clarification_history(
+            state_messages, clarification_history, initial_topic
+        )
+        clarified_topic, clarification_history = build_clarified_topic_from_history(
+            clarification_history
+        )
+        logger.info("Clarification history rebuilt: %s", clarification_history)
+        if clarification_history:
+            initial_topic = clarification_history[0]
+            latest_user_content = clarification_history[-1]
+        else:
+            latest_user_content = ""
+
+        # Add clarification status for first round
+        if clarification_rounds == 0:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "“澄清性提问”模式已激活，严格按照指令中的‘澄清性提问要求’进行提问。",
+                }
+            )
+
+        current_response = latest_user_content or "No response"
+        logger.info(
+            "Clarification round %s/%s | topic: %s | current user response: %s",
+            clarification_rounds,
+            max_clarification_rounds,
+            clarified_topic or initial_topic,
+            current_response,
+        )
+        clarification_context = f"""继续澄清性提问 (回合 {clarification_rounds}/{max_clarification_rounds}): 用户上一轮回复: {current_response}
+对缺失的维度继续澄清性提问，不要重复问题或开启新话题。"""
+        messages.append({"role": "user", "content": clarification_context})
+
+        # Bind both clarification tools - let LLM choose the appropriate one
+        tools = [handoff_to_planner, handoff_after_clarification]
+
+        # Check if we've already reached max rounds
+        if clarification_rounds >= max_clarification_rounds:
+            # Max rounds reached - force handoff by adding system instruction
+            logger.warning(
+                f"Max clarification rounds ({max_clarification_rounds}) reached. Forcing handoff to planner. Using prepared clarified topic: {clarified_topic}"
+            )
+            # Add system instruction to force handoff - let LLM choose the right tool
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"达到最大澄清回合数。你必须调用 handoff_after_clarification (not handoff_to_planner) and research_topic='{clarified_topic}'。不要继续提问了。",
+                }
+            )
+
+        llm_type = get_agent_llm_type("coordinator", configurable.enable_deep_thinking)
+        response = (
+            get_llm_by_type(llm_type)
+            .bind_tools(tools)
+            .invoke(messages)
+        )
+        logger.debug(f"Current state messages: {state['messages']}")
+
+        # Initialize response processing variables
+        goto = "__end__"
+        locale = state.get("locale", "zh-CN")
+        research_topic = (
+            clarification_history[0] if clarification_history else state.get("research_topic", "")
+        )
+        if not clarified_topic:
+            clarified_topic = research_topic
+
+        # --- Process LLM response ---
+        # No tool calls - LLM is asking a clarifying question
+        if not response.tool_calls and response.content:
+            # Check if we've reached max rounds - if so, force handoff to planner
+            if clarification_rounds >= max_clarification_rounds:
+                logger.warning(
+                    f"Max clarification rounds ({max_clarification_rounds}) reached. "
+                    "LLM didn't call handoff tool, forcing handoff to planner."
+                )
+                goto = "planner"
+                # Continue to final section instead of early return
+            else:
+                # Continue clarification process
+                clarification_rounds += 1
+                # Do NOT add LLM response to clarification_history - only user responses
+                logger.info(
+                    f"Clarification response {clarification_rounds}/{max_clarification_rounds}: {response.content}"
+                )
+                # Append coordinator's question to messages
+                updated_messages = list(state_messages)
+                if response.content:
+                    updated_messages.append(
+                        HumanMessage(content=response.content, name="coordinator")
+                    )
+                return Command(
+                    update={
+                        "messages": updated_messages,
+                        "locale": locale,
+                        "research_topic": research_topic,
+                        "resources": configurable.resources,
+                        "clarification_rounds": clarification_rounds,
+                        "clarification_history": clarification_history,
+                        "clarified_research_topic": clarified_topic,
+                        "is_clarification_complete": False,
+                        "goto": goto,
+                        "citations": state.get("citations", []),
+                        "pipeline_mode": pipeline_mode,
+                        "__interrupt__": [("coordinator", response.content)],
+                    },
+                    goto=goto,
+                )
+        else:
+            # LLM called a tool (handoff) or has no content - clarification complete
+            if response.tool_calls:
+                logger.info(
+                    f"Clarification completed after {clarification_rounds} rounds. LLM called handoff tool."
+                )
+            else:
+                logger.warning("LLM response has no content and no tool calls.")
+            # goto will be set in the final section based on tool calls
+
+    # ------------------------------------------------
+    # Final: Build and return Command
+    # ------------------------------------------------
+    messages = list(state.get("messages", [])) or []
+    if response.content:
+        messages.append(HumanMessage(content=response.content, name="coordinator"))
+
+    # Process tool calls for BOTH branches (legacy and clarification)
+    if response.tool_calls:
+        try:
+            for tool_call in response.tool_calls:
+                tool_name = tool_call.get("name", "")
+                tool_args = tool_call.get("args", {})
+                if tool_name in ["handoff_to_planner", "handoff_after_clarification"]:
+                    logger.info("Handing off to planner")
+                    goto = "planner"
+                    if not enable_clarification and tool_args.get("research_topic"):
+                        research_topic = tool_args["research_topic"]
+                    if tool_args.get("workflow_type"):
+                        workflow_type = tool_args.get("workflow_type")
+                    if tool_args.get("workflow_confidence"):
+                        workflow_confidence = tool_args.get("workflow_confidence")
+                    if enable_clarification:
+                        logger.info(
+                            "Using prepared clarified topic: %s",
+                            clarified_topic or research_topic,
+                        )
+                    else:
+                        logger.info("Using research topic for handoff: %s", research_topic)
+                    break
+        except Exception as e:
+            logger.error(f"Error processing tool calls: {e}")
+            goto = "planner"
+    else:
+        # No tool calls detected
+        if enable_clarification:
+            # BRANCH 2: Fallback to planner to ensure research proceeds
+            logger.warning(
+                "LLM didn't call any tools. This may indicate tool calling issues with the model. "
+                "Falling back to planner to ensure research proceeds."
+            )
+            logger.debug(f"Coordinator response content: {response.content}")
+            logger.debug(f"Coordinator response object: {response}")
+            goto = "planner"
+        else:
+            # BRANCH 1: No tool calls means end workflow gracefully (e.g., greeting handled)
+            logger.info("No tool calls in legacy mode - ending workflow gracefully")
+
+    # Apply background_investigation routing if enabled (unified logic)
+    if goto == "planner" and state.get("enable_background_investigation"):
+        goto = "background_investigator"
+
+    # Set default values for state variables (in case they're not defined in legacy mode)
+    if not enable_clarification:
+        clarification_rounds = 0
+        clarification_history = []
+    clarified_research_topic_value = clarified_topic or research_topic
+    # clarified_research_topic: Complete clarified topic with all clarification rounds
+    return Command(
+        update={
+            "messages": messages,
+            "locale": locale,
+            "research_topic": research_topic,
+            "workflow_type": workflow_type,
+            "workflow_confidence": workflow_confidence,
+            "clarified_research_topic": clarified_research_topic_value,
+            "resources": configurable.resources,
+            "clarification_rounds": clarification_rounds,
+            "clarification_history": clarification_history,
+            "is_clarification_complete": goto != "coordinator",
+            "goto": goto,
+            "citations": state.get("citations", []),
+            "pipeline_mode": pipeline_mode,
+        },
+        goto=goto,
+    )
+
+
+def reporter_node(state: State, config: RunnableConfig):
+    """Reporter node that write a final report."""
+    logger.info("Reporter write final report")
+    configurable = Configuration.from_runnable_config(config)
+    current_plan = state.get("current_plan")
+    original_topic = state.get("original_topic")
+    report_style = configurable.report_style
+    if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+        original_topic_title = "调查原始问题"
+    elif report_style == ReportStyle.CUSTOMER_RIGHTS_PROTECTION_REVIEW.value:
+        original_topic_title = "信用卡业务宣传文本"
+    else:
+        original_topic_title = "调查原始问题"
+
+    input_ = {
+        "messages": [
+            HumanMessage(
+                f"## {original_topic_title}\n\n{original_topic}\n\n"
+                f"## 调查计划制定思路\n\n{current_plan.thought}\n\n"
+            )
+        ]
+    }
+    modified_state = copy.deepcopy(state)
+    modified_state["messages"] = input_["messages"]
+    invoke_messages = apply_prompt_template("reporter", modified_state, configurable)
+    observations = state.get("observations", [])
+    observation_messages = []
+    for observation in observations:
+        # if observation.startswith("Below are some observations for the analyst task:"):
+        if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+            # 业务分析专家(Analyst) 的分析结果 (observations)
+            observation_content = (
+                f"# Observations (分析结果) for the analyst (业务分析专家)\n\n{observation}"
+            )
+        elif report_style == ReportStyle.CUSTOMER_RIGHTS_PROTECTION_REVIEW.value:
+            observation_content = f"## 审查结果\n\n{observation}"
+        else:
+            observation_content = f"Below are some observations for the analyst task:\n\n{observation}"
+        observation_messages.append(
+            HumanMessage(
+                content=observation_content,
+                # content=observation,
+                name="observation",
+            )
+        )
+
+    # Context compression
+    llm_type = get_agent_llm_type("reporter", configurable.enable_deep_thinking)
+    llm_token_limit = get_llm_token_limit_by_type(llm_type)
+    compressed_state = ContextManager(llm_token_limit).compress_messages(
+        {"messages": observation_messages}
+    )
+    invoke_messages += compressed_state.get("messages", [])
+
+    # Append citations AFTER observations so they are closest to the LLM's
+    # generation point. This reduces the chance of the model "forgetting"
+    # real URLs and fabricating plausible-looking ones instead.
+    # If we have collected citations, provide them to the reporter
+    citation_list = ""
+    citations = state.get("citations", [])
+    if citations:
+        citation_list = format_citations_for_reporter(citations)
+        logger.info(f"Providing {len(citations)} collected citations to reporter")
+    if citation_list:
+        invoke_messages.append(
+            HumanMessage(
+                content=citation_list,
+            )
+        )
+    logger.debug(f"reporter Current invoke messages: {invoke_messages}")
+    response = get_llm_by_type(llm_type).invoke(invoke_messages)
+    response_content = response.content
+    logger.debug(f"reporter response: {response_content}")
+    return {
+        "final_report": response_content,
+        "citations": citations,  # Pass citations through to final state
+    }
+
+
+async def _handle_recursion_limit_fallback(
+    messages: list,
+    agent_name: str,
+    llm_type,
+    state: State,
+) -> list:
+    """Handle GraphRecursionError with graceful fallback using LLM summary.
+    When the agent hits the recursion limit, this function generates a final output
+    using only the observations already gathered, without calling any tools.
+
+    Args:
+        messages: Messages accumulated during agent execution before hitting limit
+        agent_name: Name of the agent that hit the limit
+        state: Current workflow state
+
+    Returns:
+        list: Messages including the accumulated messages plus the fallback summary
+
+    Raises:
+        Exception: If the fallback LLM call fails
+    """
+    logger.warning(
+        f"Recursion limit reached for {agent_name} agent."
+        f"Attempting graceful fallback with {len(messages)} accumulated messages."
+    )
+    if len(messages) == 0:
+        return messages
+
+    # cleared_messages = messages.copy()
+    # while len(cleared_messages) > 0 and is_system_message(cleared_messages[-1]):
+    #     cleared_messages = cleared_messages[:-1]
+    cleared_messages = copy.deepcopy(messages)
+    while len(cleared_messages) > 0 and cleared_messages[-1].type == "system":
+        cleared_messages = cleared_messages[:-1]
+
+    # Prepare state for prompt template
+    fallback_state = {
+        "locale": state.get("locale", "zh-CN"),
+    }
+    # Apply the recursion_fallback prompt template
+    # system_prompt = get_system_prompt_template(agent_name, fallback_state, None)
+    limit_prompt = get_system_prompt_template("recursion_fallback", fallback_state, None)
+    # cleared_messages[0] = SystemMessage(content=f"{cleared_messages[0].content}\n\n{limit_prompt}")
+    # cleared_messages.insert(1, SystemMessage(content=limit_prompt))
+    cleared_messages.append(
+        HumanMessage(
+            content=limit_prompt,
+            name="user",
+        )
+    )
+    fallback_messages = cleared_messages
+
+    # Get the LLM without tools (strip all tools from binding)
+    fallback_llm = get_llm_by_type(llm_type)
+    logger.debug(f"fallback inputs {fallback_messages}")
+
+    # Call the LLM with the updated messages
+    fallback_response = fallback_llm.invoke(fallback_messages)
+    fallback_content = fallback_response.content
+    logger.info(
+        f"Graceful fallback succeeded for {agent_name} agent."
+        f"Generated summary of {len(fallback_content)} characters."
+    )
+
+    # Sanitize response
+    fallback_content = sanitize_tool_response(str(fallback_content))
+    # Update the step with the fallback result
+    # current_step.execution_res = fallback_content
+    # Return the accumulated messages plus the fallback response
+    result_messages = list(cleared_messages)
+    result_messages.append(AIMessage(content=fallback_content, name=agent_name))
+    return result_messages
+
+
+async def _execute_agent_step(
+    state: State,
+    agent,
+    agent_name: str,
+    config: RunnableConfig = None,
+    tool_returns_cache: list = None,
+):
+    """Helper function to execute a step using the specified agent."""
+    logger.debug(f"[_execute_agent_step] Starting execution for agent: {agent_name}")
+    current_plan = state.get("current_plan")
+    current_plan_cached = state.get("current_plan_cached")
+    plan_title = current_plan.title
+    observations = state.get("observations", [])
+    search_results = state.get("search_results", [])
+    curator_rule_splitter_views = state.get("curator_rule_splitter_views", [])
+    workflow_type = state.get("workflow_type", "")
+    workflow_type_str = "A 定点调查"
+    if workflow_type == "B":
+        workflow_type_str = "B 并行对比"
+    elif workflow_type == "C":
+        workflow_type_str = "C 扫描穷举"
+    elif workflow_type == "D":
+        workflow_type_str = "D 条件推理"
+
+    configurable = Configuration.from_runnable_config(config)
+    report_style = configurable.report_style
+    logger.info(
+        f"[_execute_agent_step] Plan title: {plan_title}, observations count: {len(observations)}, workflow_type: {workflow_type}, workflow_type_str: {workflow_type_str}"
+    )
+
+    # Find the first unexecuted step
+    current_step = None
+    completed_steps = []
+    for idx, step in enumerate(current_plan.steps):
+        if not step.execution_res:
+            current_step = step
+            logger.debug(f"[_execute_agent_step] Found unexecuted step at index {idx}: {step.title}")
+            break
+        else:
+            completed_steps.append(step)
+
+    if not current_step:
+        logger.warning(f"[_execute_agent_step] No unexecuted step found in {len(current_plan.steps)} total steps")
+        return Command(
+            update=preserve_state_meta_fields(state),
+            goto="reporter",
+        )
+
+    is_searcher = agent_name == "researcher"
+    is_curator = agent_name == "curator"
+    is_analyst = agent_name == "analyst"
+    logger.info(f"[_execute_agent_step] Executing step: {current_step.title}, agent: {agent_name}")
+    logger.debug(f"[_execute_agent_step] Completed steps so far: {len(completed_steps)}")
+
+    # Format completed steps information
+    if is_curator:
+        searcher_annotations, raw_tool_returns = search_results[-1]
+        completed_steps_info = (
+            f"# 检索结果摘要\n\n{searcher_annotations}\n\n# 原始工具返回\n\n{raw_tool_returns}\n\n"
+        )
+    elif is_searcher:
+        if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+            step_index = 1
+            completed_steps_info = ""
+            for searcher_annotations, _ in search_results:
+                if searcher_annotations:
+                    completed_steps_info += (
+                        f"# 已完成步骤{str(step_index)}-检索\n\n{searcher_annotations}\n\n"
+                    )
+                    step_index += 1
+        else:
+            completed_steps_info = ""
+    else:  # is_analyst
+        if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+            missing_conditions = state.get("missing_conditions", "无。")
+            step_index = 1
+            if workflow_type == "D":
+                completed_steps_info = f"# 调查原始问题未提供关键条件列表\n\n{missing_conditions}\n\n"
+            else:
+                completed_steps_info = ""
+
+            completed_cached_steps = []
+            if current_plan_cached:
+                for idx, step in enumerate(current_plan_cached.steps):
+                    if step.execution_res and step.step_type == StepType.RESEARCH:
+                        completed_cached_steps.append(step)
+            completed_steps += completed_cached_steps
+
+            for step in completed_steps:
+                if (
+                    "researcher agent error" in step.execution_res.lower()
+                    and step.execution_res.startswith("[ERROR]")
+                ):
+                    logger.error(f"[_execute_agent_step] Completed Step skip agent error")
+                    completed_steps_info += f"因为该步骤的Agent执行任务失败，没有获取任何相关信息。\n\n"
+                    continue
+                completed_steps_info += f"# 已完成步骤 {step_index}: {step.title}\n\n"
+                completed_steps_info += f"## 步骤背景\n\n{step.background}\n\n"
+                completed_steps_info += f"## 信息质量评估报告\n{step.execution_res}\n\n"
+                step_index += 1
+
+            arbitration_result = state.get("arbitration_result", "")
+            if arbitration_result:
+                completed_steps_info += f"# 已完成步骤 {step_index}: 矛盾信息仲裁\n\n"
+                completed_steps_info += f"{arbitration_result}\n\n"
+                step_index += 1
+        elif report_style == ReportStyle.CUSTOMER_RIGHTS_PROTECTION_REVIEW.value:
+            completed_steps_info = f"# 逐审查点完整记录\n\n"
+            # 逐审查点完整记录
+            all_atomic_rules = state.get("atomic_rules", [])
+            for atomic_rules in all_atomic_rules:
+                completed_steps_info += f"{atomic_rules}\n\n"
+        else:
+            completed_steps_info = ""
+
+    original_topic = state.get("original_topic")
+    if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+        original_topic_title = "调查原始问题"
+        workflow_prompt = f"# 当前工作流类型\n{workflow_type_str}\n\n"
+    elif report_style == ReportStyle.CUSTOMER_RIGHTS_PROTECTION_REVIEW.value:
+        original_topic_title = "信用卡业务宣传文本"
+        workflow_prompt = ""
+    else:
+        original_topic_title = "调查原始问题"
+        workflow_prompt = ""
+
+    if is_searcher:
+        agent_chn_name = "检索"
+    elif is_curator:
+        agent_chn_name = "评估"
+    else:
+        agent_chn_name = "分析"
+
+    agent_input = {"messages": []}
+    if is_curator:
+        agent_input["messages"].append(
+            HumanMessage(
+                content=(
+                    f"# {original_topic_title}\n\n{original_topic}\n\n{completed_steps_info}"
+                    f"# 当前步骤 - {agent_chn_name}\n\n"
+                    f"## {agent_chn_name}标题\n\n{current_step.title}\n\n"
+                    f"## {agent_chn_name}背景\n\n{current_step.background}\n\n"
+                    f"## {agent_chn_name}内容\n\n{current_step.description}\n\n"
+                )
+            )
+        )
+    else:
+        agent_input["messages"].append(
+            HumanMessage(
+                content=(
+                    f"# {original_topic_title}\n\n{original_topic}\n\n{workflow_prompt}{completed_steps_info}"
+                    f"# 当前步骤 - {agent_chn_name}\n\n"
+                    f"## {agent_chn_name}标题\n\n{current_step.title}\n\n"
+                    f"## {agent_chn_name}背景\n\n{current_step.background}\n\n"
+                    f"## {agent_chn_name}内容\n\n{current_step.description}\n\n"
+                )
+            )
+        )
+
+    replan_iterations = state.get("replan_iterations", 0)
+    MAX_ITERATIONS = 2
+    if (
+        report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value
+        and replan_iterations >= MAX_ITERATIONS
+    ):
+        agent_input["messages"].append(HumanMessage(content="注意：当前规划迭代次数已经达到最大值"))
+
+    # Invoke the agent
+    default_recursion_limit = 25
+    try:
+        env_value_str = os.getenv("NODE_RECURSION_LIMIT", str(default_recursion_limit))
+        parsed_limit = int(env_value_str)
+        if parsed_limit > 0:
+            recursion_limit = parsed_limit
+            logger.info(f"Recursion limit set to: {recursion_limit}")
+        else:
+            logger.warning(
+                f"NODE_RECURSION_LIMIT value '{env_value_str}' (parsed as {parsed_limit}) is not positive. "
+                f"Using default value {default_recursion_limit}."
+            )
+            recursion_limit = default_recursion_limit
+    except ValueError:
+        raw_env_value = os.getenv("NODE_RECURSION_LIMIT")
+        logger.warning(
+            f"Invalid NODE_RECURSION_LIMIT value: '{raw_env_value}'. "
+            f"Using default value {default_recursion_limit}."
+        )
+        recursion_limit = default_recursion_limit
+
+    logger.debug(f"Agent input: {agent_input}")
+    # Validate message content before invoking agent
+    try:
+        validated_messages = validate_message_content(agent_input["messages"])
+        agent_input["messages"] = validated_messages
+    except Exception as validation_error:
+        logger.error(f"Error validating agent input messages: {validation_error}")
+
+    modified_state = copy.deepcopy(state)
+    modified_state["messages"] = agent_input["messages"]
+    accumulated_messages = []
+    try:
+        # Use astream (async) from the start to capture messages in real-time
+        # This allows us to retrieve accumulated messages even if recursion limit is hit
+        # NOTE: astream is required for MCP tools which only support async invocation
+        async for chunk in agent.astream(
+            input={"messages": apply_prompt_template(agent_name, modified_state, configurable)},
+            config={"recursion_limit": recursion_limit},
+            stream_mode="values",
+        ):
+            if isinstance(chunk, dict) and "messages" in chunk:
+                accumulated_messages = chunk["messages"]
+        # If we get here, execution completed successfully
+        llm_result = {"messages": accumulated_messages}
+    except GraphRecursionError:
+        # Check if recursion fallback is enabled
+        configurable = Configuration.from_runnable_config(config) if config else Configuration()
+        if configurable.enable_recursion_fallback:
+            try:
+                # Call fallback with accumulated messages (function returns list of messages)
+                llm_type = get_agent_llm_type(agent_name, configurable.enable_deep_thinking)
+                fallback_response_messages = await _handle_recursion_limit_fallback(
+                    messages=accumulated_messages,
+                    agent_name=agent_name,
+                    llm_type=llm_type,
+                    state=state,
+                )
+                # Create result dict so the code can continue normally from line 1178
+                llm_result = {"messages": fallback_response_messages}
+            except Exception as fallback_error:
+                # If fallback fails, log and fall through to standard error handling
+                logger.error(
+                    f"Recursion fallback failed for {agent_name} agent: {fallback_error}. "
+                    "Falling back to standard error handling."
+                )
+                raise
+        else:
+            # Fallback disabled, let error propagate to standard handler
+            logger.info(
+                f"Recursion limit reached but graceful fallback is disabled. Using standard error handling."
+            )
+            raise
+    except Exception as e:
+        import traceback
+
+        error_traceback = traceback.format_exc()
+        error_message = f"Error executing {agent_name} agent for step '{current_step.title}': {str(e)}"
+        logger.exception(error_message)
+        logger.error(f"Full traceback:\n{error_traceback}")
+        # Enhanced error diagnostics for content-related errors
+        if "Field required" in str(e) and "content" in str(e):
+            logger.error(f"Message content validation error detected")
+            for i, msg in enumerate(agent_input.get("messages", [])):
+                logger.error(
+                    f"Message {i}: type={type(msg).__name__}, "
+                    f"has_content={hasattr(msg, 'content')}, "
+                    f"content_type={type(msg.content).__name__ if hasattr(msg, 'content') else 'N/A'}, "
+                    f"content_len={len(str(msg.content)) if hasattr(msg, 'content') and msg.content else 0}"
+                )
+        return Command(
+            update=preserve_state_meta_fields(state),
+            goto="__end__",
+        )
+
+    # Include all messages from agent result to preserve intermediate tool calls/results
+    # This ensures multiple web_search calls all appear in the stream, not just the final result
+    agent_messages = llm_result["messages"]
+    response_content = agent_messages[-1].content
+    logger.info(
+        f"Step '{current_step.title}' execution completed by {agent_name}\n"
+        f"{agent_name.capitalize()} returned {len(agent_messages)} messages. "
+        f"Message types: {[type(msg).__name__ for msg in agent_messages]}"
+    )
+
+    if is_analyst:
+        parsed_analyst_res = _parse_analyst_output(response_content)
+        # Validate explicitly that response content is valid JSON before proceeding to parse it
+        if parsed_analyst_res is None:
+            logger.error(
+                f"{agent_name} response does not appear to be valid XML or JSON after cleanup\n\n{response_content}"
+            )
+            return Command(
+                update=preserve_state_meta_fields(state),
+                goto="__end__",
+            )
+        replanning_needed = bool(parsed_analyst_res and parsed_analyst_res.get("replan"))
+        current_step.execution_res = response_content
+        if (
+            report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value
+            and replanning_needed
+            and replan_iterations <= MAX_ITERATIONS
+        ):
+            replanning_reason = parsed_analyst_res.get("replan_reason", "")
+            logger.info("Analyst requested replanning due to insufficient evidence.")
+            replan_iterations += 1
+            messages = list(state.get("messages", [])) or []
+            skip_idx = 0
+            for idx, m in enumerate(messages):
+                if not is_user_message(m):
+                    break
+                skip_idx = idx
+            skip_idx += 1
+            delete_messages = [RemoveMessage(id=m.id) for m in messages[skip_idx:]]
+            return Command(
+                update={
+                    **preserve_state_meta_fields(state),
+                    "replan": replanning_needed,
+                    "replan_reason": replanning_reason,
+                    "messages": delete_messages,
+                    "observations": observations,
+                    "replan_iterations": replan_iterations,
+                    "current_plan_cached": current_plan,
+                    "current_plan": "",
+                    "planner_override_occurred": False,
+                    "structure_validation_retried": False,
+                },
+                goto="planner",
+            )
+        else:
+            analyst_result = prepare_reporter_input(parsed_analyst_res, report_style, workflow_type)
+            return Command(
+                update={
+                    **preserve_state_meta_fields(state),
+                    "replan": replanning_needed,
+                    "replan_reason": "",
+                    "messages": agent_messages,
+                    "observations": observations + [analyst_result],
+                    "replan_iterations": replan_iterations,
+                },
+                goto="reporter",
+            )
+    elif is_searcher:
+        if tool_returns_cache is None:
+            return Command(
+                update=preserve_state_meta_fields(state),
+                goto="__end__",
+            )
+        existing_citations = state.get("citations", [])
+        existing_maps = state.get("document_chunk_maps", {})
+        existing_metadata = state.get("document_metadata", {})
+        curator_tool_input = format_tool_cache_for_curator(tool_returns_cache, current_step.title)
+        # —— 提取 chunk_maps 和文档元数据 ——
+        new_chunk_maps = extract_chunk_maps_from_cache(tool_returns_cache)
+        # —— 合并到全局 chunk_maps（State 中已有的 + 本步骤须新增的）——
+        for doc_title, cmap in new_chunk_maps.items():
+            if doc_title in existing_maps:
+                existing_maps[doc_title].update(cmap)
+            else:
+                existing_maps[doc_title] = cmap
+        # Document metadata (全局累积)
+        new_doc_metadata = extract_document_metadata_from_cache(tool_returns_cache)
+        existing_metadata.update(new_doc_metadata)
+        # Extract citations from tool call results (local_search, crawl, fetch)
+        new_citations = extract_citations_from_cache(tool_returns_cache)
+        # Citations (跨步骤 merge)
+        merged_citations = merge_citations(existing_citations, new_citations)
+        if new_citations:
+            logger.info(
+                f"Extracted {len(new_citations)} new citations from {agent_name} agent. Total citations: {len(merged_citations)}"
+            )
+        logger.info(f"curator_tool_input [{len(curator_tool_input)} chars]")
+        return Command(
+            update={
+                **preserve_state_meta_fields(state),
+                "messages": agent_messages,
+                "search_results": search_results + [(response_content, curator_tool_input)],
+                # 全局 chunk_map 累积
+                "document_chunk_maps": existing_maps,
+                # 全局文档元数据累积
+                "document_metadata": existing_metadata,
+                "citations": merged_citations,  # Store merged citations based on existing state and new tool results
+            },
+            goto="curator",
+        )
+    else:  # curator
+        if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+            try:
+                curator_output = parse_curator_output(response_content)
+                resolved = resolve_all_evidence_chunks(
+                    curator_output=curator_output,
+                    document_chunk_maps=state["document_chunk_maps"],
+                )
+                # 使用 resolved_chunks 替换 body 中的具体内容（原文段落，未经精简）
+                curator_rule_splitter_view = build_rule_splitter_view_with_resolved(
+                    curator_output, resolved
+                )
+                curator_analyst_view = generate_analysis_view(curator_output, resolved)
+            except CuratorParseError as e:
+                logger.error(f"Curator 输出解析失败: {e}\n\n{response_content}\n重新推理...")
+                curator_analyst_view = ""
+                curator_rule_splitter_view = ""
+
+            if not curator_analyst_view and not curator_rule_splitter_view:
+                try:
+                    async for chunk in agent.astream(
+                        input={"messages": apply_prompt_template(agent_name, modified_state, configurable)},
+                        config={"recursion_limit": recursion_limit},
+                        stream_mode="values",
+                    ):
+                        if isinstance(chunk, dict) and "messages" in chunk:
+                            accumulated_messages = chunk["messages"]
+                    # If we get here, execution completed successfully
+                    result = {"messages": accumulated_messages}
+                except Exception as e:
+                    import traceback
+
+                    error_traceback = traceback.format_exc()
+                    error_message = f"Error executing {agent_name} agent for step '{current_step.title}': {str(e)}"
+                    logger.exception(error_message)
+                    logger.error(f"Full traceback:\n{error_traceback}")
+                    # Enhanced error diagnostics for content-related errors
+                    if "Field required" in str(e) and "content" in str(e):
+                        logger.error(f"Message content validation error detected")
+                        for i, msg in enumerate(agent_input.get("messages", [])):
+                            logger.error(
+                                f"Message {i}: type={type(msg).__name__}, "
+                                f"has_content={hasattr(msg, 'content')}, "
+                                f"content_type={type(msg.content).__name__ if hasattr(msg, 'content') else 'N/A'}, "
+                                f"content_len={len(str(msg.content)) if hasattr(msg, 'content') and msg.content else 0}"
+                            )
+                    return Command(
+                        update=preserve_state_meta_fields(state),
+                        goto="__end__",
+                    )
+                response_messages = result["messages"]
+                response_content = response_messages[-1].content
+                try:
+                    curator_output = parse_curator_output(response_content)
+                    resolved = resolve_all_evidence_chunks(
+                        curator_output=curator_output,
+                        document_chunk_maps=state["document_chunk_maps"],
+                    )
+                    # 使用 resolved_chunks 替换 body 中的具体内容（原文段落，未经精简）
+                    curator_rule_splitter_view = build_rule_splitter_view_with_resolved(
+                        curator_output, resolved
+                    )
+                    curator_analyst_view = generate_analysis_view(curator_output, resolved)
+                except CuratorParseError as e:
+                    logger.error(f"Curator 第二次输出解析失败: {e}\n\n{response_content}")
+                    curator_analyst_view = "[ERROR] researcher agent error, 两次输出解析均失败。"
+                    curator_rule_splitter_view = ""
+
+            current_step.execution_res = curator_analyst_view
+            return {
+                **preserve_state_meta_fields(state),
+                "messages": agent_messages,
+                "curator_rule_splitter_views": curator_rule_splitter_views + [curator_rule_splitter_view],
+                "observations": observations,
+            }
+        else:
+            current_step.execution_res = response_content
+            current_curator_info = (
+                f"# 当前分析信息\n\n"
+                f"## 分析标题\n\n{current_step.title}\n\n"
+                f"## 分析背景\n\n{current_step.background}\n\n"
+                f"## 相关总行指引和法规依据\n\n{response_content}"
+            )
+            return {
+                **preserve_state_meta_fields(state),
+                "messages": agent_messages,
+                "observations": observations,
+                "curator_rule_splitter_views": curator_rule_splitter_views + [current_curator_info],
+            }
+
+
+async def researcher_node(state: State, config: RunnableConfig) -> Command[Literal["curator"]]:
+    """Searcher node that do search"""
+    logger.info("researcher_node is researching.")
+    logger.debug(f"[researcher_node] Starting researcher agent")
+    configurable = Configuration.from_runnable_config(config)
+    logger.debug(f"[researcher_node] Max search results: {configurable.max_search_results}")
+
+    # Build tools list based on configuration
+    # Add retriever tool if resources are available (always add, higher priority)
+    retriever_tool = get_retriever_tool(
+        configurable.max_search_results,
+        configurable.report_style,
+        state.get("resources", []),
+    )
+    if retriever_tool:
+        logger.debug(f"[researcher_node] Adding retriever tool to tools list")
+    else:
+        return Command(
+            update=preserve_state_meta_fields(state),
+            goto="__end__",
+        )
+    tools = [retriever_tool, crawl_tool, fetch_tool]
+    logger.info(f"[researcher_node] Researcher tools count: {len(tools)}")
+    logger.debug(
+        f"[researcher_node] Researcher tools: {[tool.name if hasattr(tool, 'name') else str(tool) for tool in tools]}"
+    )
+    tool_returns_cache = []
+    agent_type = "researcher"
+    agent = create_agent(agent_type, config, tools, tool_returns_cache)
+    return await _execute_agent_step(state, agent, agent_type, config, tool_returns_cache)
+
+
+async def curator_node(state: State, config: RunnableConfig):
+    """Curator node"""
+    logger.info("Curator node is analyzing.")
+    logger.debug(f"[curator_node] Starting curator agent")
+    agent_type = "curator"
+    agent = create_agent(agent_type, config, [])
+    # curator uses no tools - pure LLM reasoning
+    return await _execute_agent_step(state, agent, agent_type, config)
+
+
+async def analyst_node(state: State, config: RunnableConfig) -> Command[Literal["planner", "reporter"]]:
+    """Analyst node that performs reasoning and analysis without code execution.
+    This node handles tasks like:
+    - Cross-validating information from multiple sources
+    - Synthesizing research findings
+    - Comparative analysis
+    - Pattern recognition and trend analysis
+    - General reasoning tasks that don't require code
+    """
+    logger.info("Analyst node is analyzing.")
+    logger.debug(f"[analyst_node] Starting analyst agent for reasoning/analysis tasks")
+    agent_type = "analyst"
+    agent = create_agent(agent_type, config, [])
+    # Analyst uses no tools - pure LLM reasoning
+    return await _execute_agent_step(state, agent, agent_type, config)
+
+
+async def get_response(agent, state, agent_input, agent_name, configurable):
+    # Validate message content before invoking agent
+    try:
+        validated_messages = validate_message_content(agent_input["messages"])
+        agent_input["messages"] = validated_messages
+    except Exception as validation_error:
+        logger.error(f"Error validating agent input messages: {validation_error}")
+
+    modified_state = copy.deepcopy(state)
+    modified_state["messages"] = agent_input["messages"]
+    accumulated_messages = []
+    try:
+        # Use astream (async) from the start to capture messages in real-time
+        # This allows us to retrieve accumulated messages even if recursion limit is hit
+        # NOTE: astream is required for MCP tools which only support async invocation
+        async for chunk in agent.astream(
+            input={"messages": apply_prompt_template(agent_name, modified_state, configurable)},
+            # config={"configurable": {"output_token_limit": max_tokens}},
+            stream_mode="values",
+        ):
+            if isinstance(chunk, dict) and "messages" in chunk:
+                accumulated_messages = chunk["messages"]
+        # response_content = accumulated_messages[-1].content
+        if accumulated_messages:
+            response_content = accumulated_messages[-1].content.strip()
+            return response_content
+    except Exception as e:
+        import traceback
+
+        error_traceback = traceback.format_exc()
+        error_message = f"Error executing {agent_name} agent: {str(e)}"
+        logger.exception(error_message)
+        logger.error(f"Full traceback:\n{error_traceback}")
+        # Enhanced error diagnostics for content-related errors
+        if "Field required" in str(e) and "content" in str(e):
+            logger.error(f"Message content validation error detected")
+            for i, msg in enumerate(modified_state.get("messages", [])):
+                logger.error(
+                    f"Message {i}: type={type(msg).__name__}, "
+                    f"has_content={hasattr(msg, 'content')}, "
+                    f"content_type={type(msg.content).__name__ if hasattr(msg, 'content') else 'N/A'}, "
+                    f"content_len={len(str(msg.content)) if hasattr(msg, 'content') and msg.content else 0}"
+                )
+        return None
+
+
+async def rule_splitter_node(state: State, config: RunnableConfig) -> dict:
+    """业务原子规则拆分专家"""
+
+    def extract_content_after_heading(text: str) -> str:
+        """从多行字符串中提取 "# 相关总行指引和法规依据" 标题后面的所有内容。
+        参数:
+            text (str): 输入的多行字符串
+        返回:
+            str: 标题之后的所有内容（不含标题），若未找到则返回空字符串
+        """
+        # 定义正则表达式：匹配标题后的所有内容（包括换行）
+        pattern = r"#\s*相关总行指引和法规依据\s*\n(.*)"
+        # 使用 re.DOTALL 使 . 匹配包括换行符在内的所有字符
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            # 返回标题之后的所有内容，去除可能的前导空白
+            content = match.group(1).lstrip("\n")
+            # 去掉紧接标题后的换行
+            return content
+        else:
+            # 标题未找到，返回空字符串
+            return ""
+
+    logger.info("Rule Splitter node is running.")
+    all_views = state.get("curator_rule_splitter_views", [])
+    atomic_rules = state.get("atomic_rules", [])
+    agent_type = "rule_splitter"
+    if not all_views:
+        return {
+            "atomic_rules": atomic_rules,
+            **preserve_state_meta_fields(state),
+        }
+    idx_str = str(len(atomic_rules) + 1)
+    latest_view = all_views[-1] if all_views else ""
+    configurable = Configuration.from_runnable_config(config)
+    original_topic = state.get("original_topic")
+    if latest_view:
+        report_style = configurable.report_style
+        if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+            agent_input = {
+                "messages": [
+                    HumanMessage(
+                        content=f"\n\n# 调查原始问题\n\n{original_topic}\n\n# 信息质量评估报告\n\n{latest_view}",
+                        name="user",
+                    )
+                ]
+            }
+        elif report_style == ReportStyle.CUSTOMER_RIGHTS_PROTECTION_REVIEW.value:
+            agent_input = {
+                "messages": [
+                    HumanMessage(
+                        content=f"\n\n# 信用卡业务宣传文本\n\n{original_topic}\n\n{latest_view}",
+                        name="user",
+                    )
+                ]
+            }
+            state = {
+                **state,
+                "cp_edge_constraints": render_cp_edge_constraints_for_assessor(),
+                "element_class_mapping": render_element_class_mapping(),
+            }
+        else:
+            agent_input = {
+                "messages": [
+                    HumanMessage(
+                        content=f"\n\n# 调查原始问题\n\n{original_topic}\n\n# 信息质量评估报告\n\n{latest_view}",
+                        name="user",
+                    )
+                ]
+            }
+        rule_splitter = create_agent(agent_type, config, [])
+        this_filtering_content = await get_response(
+            rule_splitter, state, agent_input, agent_type, configurable
+        )
+        if this_filtering_content is not None and this_filtering_content:
+            if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
+                this_filtering_content = this_filtering_content.replace(
+                    "## 限定性特征", f"## 限定性特征 {idx_str}"
+                )
+                this_filtering_content = this_filtering_content.replace(
+                    "## 关联业务原子规则清单", f"## 关联业务原子规则清单 {idx_str}"
+                )
+                this_filtering_content = this_filtering_content.replace(
+                    "**业务原子规则", f"**业务原子规则{idx_str}"
+                )
+            elif report_style == ReportStyle.CUSTOMER_RIGHTS_PROTECTION_REVIEW.value:
+                latest_view_str = extract_content_after_heading(latest_view)
+                this_filtering_content = this_filtering_content.strip()
+                this_filtering_content = (
+                    f"\n\n---\n\n### 合规判定结果 {idx_str}\n\n{this_filtering_content}\n\n"
+                    f"## 相关总行指引和法规依据 {idx_str}\n\n{latest_view_str}\n\n---\n\n"
+                )
+            logger.debug(f"rule_splitter response_content reasoning {this_filtering_content}")
+            return {
+                "atomic_rules": atomic_rules + [this_filtering_content],
+                **preserve_state_meta_fields(state),
+            }
+    logger.warning(f"No split rules found for rule_splitter, Curator 输出解析失败")
+    return {
+        "atomic_rules": atomic_rules,
+        **preserve_state_meta_fields(state),
+    }
+
+
+async def arbitrator_node(state: State, config: RunnableConfig) -> dict:
+    """业务矛盾仲裁专家"""
+    logger.info("Arbitrator node is running to resolve conflicts.")
+    all_atomic_rules = state.get("atomic_rules", [])
+    arbitration_result = state.get("arbitration_result", "")
+    if not all_atomic_rules:
+        logger.warning("No atomic rules found for arbitration.")
+        return {"arbitration_result": arbitration_result}
+    all_atomic_rules_str = "\n\n".join(all_atomic_rules)
+    configurable = Configuration.from_runnable_config(config)
+    original_topic = state.get("original_topic")
+    workflow_type = state.get("workflow_type", "")
+    workflow_type_str = "A 定点调查"
+    if workflow_type == "B":
+        workflow_type_str = "B 并行对比"
+    elif workflow_type == "C":
+        workflow_type_str = "C 扫描穷举"
+    elif workflow_type == "D":
+        workflow_type_str = "D 条件推理"
+
+    agent_type = "arbitrator"
+    arbitrator = create_agent(
+        agent_type,
+        config,
+        [],
+    )
+    agent_input = {
+        "messages": [
+            HumanMessage(
+                content=f"# 调查原始问题\n\n{original_topic}\n\n# 当前工作流类型\n\n{workflow_type_str}\n\n{all_atomic_rules_str}",
+                name="user",
+            )
+        ]
+    }
+    sub = {
+        **state,
+        "arbitrator_bucketing_guide": render_arbitrator_bucketing_guide(),
+    }
+    response_content = await get_response(arbitrator, sub, agent_input, agent_type, configurable)
+    if response_content is not None and response_content:
+        logger.debug(f"arbitrator response_content {response_content}")
+        return {
+            "arbitration_result": response_content,
+            **preserve_state_meta_fields(state),
+        }
+    logger.warning(f"No atomic rules found for arbitration. response_content {response_content}")
+    return {
+        "arbitration_result": arbitration_result,
+        **preserve_state_meta_fields(state),
+    }
+
+
+def _extract_xml_block(text: str, tag: str) -> str:
+    """提取 <tag>...</tag> 标签内的文本（非贪婪，取第一个匹配）。无匹配返回空串。"""
+    if not text:
+        return ""
+    m = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def _parse_analyst_output(text: str) -> dict[str, Any] | None:
+    """
+    解析 Analyst 输出（XML 标签 + 小 JSON 混合契约）。
+    新契约 (analyst.md 2026-06-11 起):
+      <analyst_meta>{小 JSON...}</analyst_meta>
+      <analysis_text>Markdown...</analysis_text>
+      <contradiction_text>...</contradiction_text>
+      <risk_text>...</risk_text>
+
+    兼容路径：未发现 <analyst_meta> 标签时回退到旧版"单一大 JSON"解析，保证旧提示词缓存 / 模型未遵循新契约时不致硬失败。
+    返回与旧契约同构的 dict（文本块以 analysis_text 等 key 并入，便于下游 (reporter / replanning 判断) 无感切换。
+    """
+    if not text or not text.strip():
+        return None
+    meta_raw = _extract_xml_block(text, "analyst_meta")
+    if not meta_raw:
+        # 旧契约回退：整体当作一个 JSON 对象解析
+        return _parse_json_object(text)
+    parsed = _parse_json_object(meta_raw)
+    if parsed is None:
+        return None
+    for tag in ("analysis_text", "contradiction_text", "risk_text"):
+        block = _extract_xml_block(text, tag)
+        if block:
+            parsed[tag] = block
+    return parsed
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:
@@ -219,7 +2043,6 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
         return json.loads(repair_json_output(raw))
     except json.JSONDecodeError:
         pass
-
     # 退化路径：不使用正则，从文本中按括号平衡提取第一个 JSON 对象
     start = raw.find("{")
     if start >= 0:
@@ -250,1582 +2073,3 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
                     except json.JSONDecodeError:
                         break
     return None
-
-
-def _extract_xml_block(text: str, tag: str) -> str:
-    """提取 <tag>…</tag> 标签内的文本（非贪婪，取第一个匹配）。无匹配返回空串。"""
-    if not text:
-        return ""
-    m = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
-    return m.group(1).strip() if m else ""
-
-
-def _parse_analyst_output(text: str) -> dict[str, Any] | None:
-    """
-    解析 Analyst 输出（XML 标签 + 小 JSON 混合契约）。
-
-    新契约（analyst.md 2026-06-11 起）：
-        <analyst_meta>{ …小 JSON… }</analyst_meta>
-        <analysis_text>…Markdown…</analysis_text>
-        <contradiction_text>…</contradiction_text>
-        <risk_text>…</risk_text>
-
-    兼容路径：未发现 <analyst_meta> 标签时回退到旧版"单一大 JSON"解析，
-    保证旧提示词缓存 / 模型未遵循新契约时不致硬失败。
-
-    返回与旧契约同构的 dict（文本块以 analysis_text 等 key 并入），便于
-    下游（reporter / replanning 判断）无感切换。
-    """
-    if not text or not text.strip():
-        return None
-
-    meta_raw = _extract_xml_block(text, "analyst_meta")
-    if not meta_raw:
-        # 旧契约回退：整体当作一个 JSON 对象解析
-        return _parse_json_object(text)
-
-    parsed = _parse_json_object(meta_raw)
-    if parsed is None:
-        return None
-
-    for tag in ("analysis_text", "contradiction_text", "risk_text"):
-        block = _extract_xml_block(text, tag)
-        if block:
-            parsed[tag] = block
-    return parsed
-
-
-def _normalize_plan_dict(plan_dict: dict[str, Any]) -> dict[str, Any]:
-    """
-    对 planner 输出做轻量结构修复，保证与 planner.zh_CN.md 的输入/输出契约一致。
-    """
-    fixed = dict(plan_dict or {})
-    fixed.setdefault("thought", "")
-    fixed.setdefault("title", "")
-    fixed.setdefault("workflow_type", "A")
-    fixed.setdefault("missing_conditions", [])
-    steps = fixed.get("steps")
-    if not isinstance(steps, list):
-        steps = []
-    normalized_steps: list[dict[str, Any]] = []
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        s = dict(step)
-        # step_type / need_search 双向兜底
-        if not s.get("step_type"):
-            s["step_type"] = "research" if s.get("need_search", False) else "analysis"
-        if "need_search" not in s:
-            s["need_search"] = s.get("step_type") == "research"
-        # planner.zh_CN.md 要求每步必须有 background
-        s.setdefault("background", s.get("title", ""))
-        s.setdefault("description", "")
-        s.setdefault("title", "")
-        normalized_steps.append(s)
-    fixed["steps"] = normalized_steps
-    return fixed
-
-
-def _dedupe_citations_preserve_order(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    out: list[dict[str, Any]] = []
-    for c in citations or []:
-        if not isinstance(c, dict):
-            continue
-        url = (c.get("url") or "").strip()
-        title = (c.get("title") or "").strip()
-        key = url if url else f"title:{title}"
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(c)
-    return out
-
-
-def _format_citation_list_for_reporter(citations: list[dict[str, Any]]) -> str:
-    ordered = _dedupe_citations_preserve_order(citations)
-    if not ordered:
-        return (
-            "### 可用参考来源（Citation list）\n\n"
-            "当前无结构化引用条目。**禁止编造 URL。**\n"
-            "若无链接，仅用《文档名》指代，勿使用 `[[n]](#ref-n)`。"
-        )
-    lines = [
-        "### 可用参考来源（Citation list）",
-        "",
-        "正文可溯源结论须在句末使用 **`[[n]](#ref-n)`**，n 与下表序号一致；勿编造未列出来源。",
-        "",
-    ]
-    for i, c in enumerate(ordered, 1):
-        title = str(c.get("title") or "Untitled").strip() or "Untitled"
-        url = str(c.get("url") or "").strip()
-        extra = c.get("extra") if isinstance(c.get("extra"), dict) else {}
-        lines.append(f"{i}. **{title}**")
-        if url:
-            lines.append(f"   - URL: `{url}`")
-        lines.append("")
-    return "\n".join(lines).rstrip()
-
-
-def extract_plan_content(plan_data: str | dict | Any) -> str:
-    if isinstance(plan_data, str):
-        return plan_data
-    if hasattr(plan_data, "content") and isinstance(plan_data.content, str):
-        return plan_data.content
-    if isinstance(plan_data, dict):
-        if "content" in plan_data:
-            c = plan_data["content"]
-            if isinstance(c, str):
-                return c
-            if isinstance(c, dict):
-                return json.dumps(c, ensure_ascii=False)
-            return str(c)
-        return json.dumps(plan_data, ensure_ascii=False)
-    return str(plan_data)
-
-
-async def _handle_recursion_limit_fallback(
-    messages: list,
-    agent_name: str,
-    state: State,
-) -> list:
-    """Handle GraphRecursionError with graceful fallback using LLM summary.
-
-    When the agent hits the recursion limit, this function generates a final output
-    using only the observations already gathered, without calling any tools.
-
-    Args:
-        messages: Messages accumulated during agent execution before hitting limit
-        agent_name: Name of the agent that hit the limit
-        current_step: The current step being executed
-        state: Current workflow state
-
-    Returns:
-        list: Messages including the accumulated messages plus the fallback summary
-
-    Raises:
-        Exception: If the fallback LLM call fails
-    """
-    logger.warning(
-        f"Recursion limit reached for {agent_name} agent. "
-        f"Attempting graceful fallback with {len(messages)} accumulated messages."
-    )
-
-    if len(messages) == 0:
-        return messages
-
-    cleared_messages = messages.copy()
-    while len(cleared_messages) > 0 and cleared_messages[-1].type == "system":
-        cleared_messages = cleared_messages[:-1]
-
-    # Prepare state for prompt template
-    fallback_state = {
-        "locale": state.get("locale", "en-US"),
-    }
-
-    # Apply the recursion_fallback prompt template
-    limit_prompt = get_system_prompt_template("recursion_fallback", fallback_state, None)
-    fallback_messages = cleared_messages + [
-        SystemMessage(content=limit_prompt)
-    ]
-
-    # Get the LLM without tools (strip all tools from binding)
-    fallback_llm = get_llm_by_type(AGENT_LLM_MAP[agent_name])
-
-    # Call the LLM with the updated messages
-    fallback_response = fallback_llm.invoke(fallback_messages)
-    fallback_content = fallback_response.content
-
-    logger.info(
-        f"Graceful fallback succeeded for {agent_name} agent. "
-        f"Generated summary of {len(fallback_content)} characters."
-    )
-
-    # Sanitize response
-    fallback_content = sanitize_tool_response(str(fallback_content))
-
-    # Return the accumulated messages plus the fallback response
-    result_messages = list(cleared_messages)
-    result_messages.append(AIMessage(content=fallback_content, name=agent_name))
-
-    return result_messages
-
-
-async def background_investigation_node(state: State, config: RunnableConfig) -> dict:
-    """BGI / Analyzer 双模式节点（BI + CP 共享，按 pipeline_mode 路由提示词）。
-
-    BI 模式（pipeline_mode="bi"）：
-        阶段 1 — 调用 BI/background_investigator.md（ReAct Agent + KB 探索）→ kb_panorama
-        阶段 2 — 调用 BI/ontology_mapper.md（纯 LLM 本体映射）→ background_investigation_results
-
-    CP 模式（pipeline_mode="cp"）：
-        调用 CP/analyzer.md（纯 LLM 审查范围分析）→ analyzer_output
-        不做 KB 探索和本体映射（CP 无需背景调研，Analyzer 直接分析宣传文本）
-    """
-    logger.info("background_investigation_node running (mode=%s)", state.get("pipeline_mode", "bi"))
-    configurable = Configuration.from_runnable_config(config)
-    mode = state.get("pipeline_mode", "bi")
-
-    if mode == "cp":
-        return await _run_cp_analyzer(state, configurable)
-    else:
-        return await _run_bi_bgi_and_mapper(state, config, configurable)
-
-
-async def _run_cp_analyzer(state: State, configurable: Configuration) -> dict:
-    """CP 模式：调用 CP/analyzer.md 分析宣传文本。"""
-    promo = state.get("promotional_text", "")
-    if not promo:
-        logger.warning("CP analyzer: no promotional_text, skipping")
-        return {
-            "analyzer_output": "",
-            "background_investigation_results": json.dumps([], ensure_ascii=False),
-            "kb_panorama": "",
-            **preserve_state_meta_fields(state),
-        }
-
-    from .ontology import get_cp_analyzer_template_vars
-
-    sub: dict = {
-        **state,
-        **get_cp_analyzer_template_vars(),
-        "messages": [HumanMessage(content=f"## 信用卡业务宣传文本\n\n{promo}")],
-    }
-    llm = get_llm_by_type(AGENT_LLM_MAP.get("cp_analyzer", "basic"))
-    try:
-        resp = await llm.ainvoke(
-            apply_prompt_template("CP/analyzer", sub, configurable)
-        )
-        analyzer_output = str(resp.content or "")
-    except Exception as e:
-        logger.exception("CP analyzer failed: %s", e)
-        analyzer_output = f"[Analyzer 执行失败: {e}]"
-
-    return {
-        "analyzer_output": analyzer_output,
-        "background_investigation_results": json.dumps([], ensure_ascii=False),
-        "kb_panorama": "",
-        **preserve_state_meta_fields(state),
-    }
-
-
-async def _run_bi_bgi_and_mapper(
-    state: State, config: RunnableConfig, configurable: Configuration
-) -> dict:
-    """BI 模式：BGI 多角度 KB 探索 + Ontology Mapper 双阶段。"""
-    q = state.get("clarified_research_topic") or state.get("research_topic", "")
-    if not q:
-        return {
-            "background_investigation_results": json.dumps([], ensure_ascii=False),
-            "kb_panorama": "",
-            **preserve_state_meta_fields(state),
-        }
-
-    locale = state.get("locale", "zh_CN")
-    wf = state.get("workflow_type", "A")
-
-    # ════════════════════════════════════════════════════
-    #  阶段 1：BGI 多角度 KB 探索 → kb_panorama
-    # ════════════════════════════════════════════════════
-    kb_panorama = ""
-    tools = [t for t in [get_retriever_tool(state.get("resources", [])), crawl_tool] if t]
-    if tools:
-        # BGI 输入：用户问题 + 工作流类型（Coordinator 已输出）
-        # 注意：missing_conditions 由 Planner 输出，BGI 在 Planner 之前执行，不可引用
-        bgi_user = f"## 用户问题\n{q}\n\n## 工作流类型\n{wf}\n"
-
-        llm_limit = get_llm_token_limit_by_type(
-            AGENT_LLM_MAP.get("background_investigator", "basic")
-        )
-        hook = partial(ContextManager(llm_limit, 3).compress_messages)
-        bgi_agent = create_agent(
-            "background_investigator",
-            "background_investigator",
-            tools,
-            "background_investigator",
-            hook,
-            interrupt_before_tools=configurable.interrupt_before_tools,
-            locale=locale,
-        )
-        try:
-            bgi_out = await bgi_agent.ainvoke(
-                {"messages": [HumanMessage(content=bgi_user)]},
-                config={"recursion_limit": 15},
-            )
-            bgi_msgs = bgi_out.get("messages", [])
-            bgi_last = _last_ai_message(bgi_msgs)
-            kb_panorama = sanitize_tool_response(
-                str(get_message_content(bgi_last) or "")
-            )
-        except Exception as e:
-            logger.warning("BGI agent failed, kb_panorama will be empty: %s", e)
-
-    # ════════════════════════════════════════════════════
-    #  阶段 2：Ontology Mapper → background_investigation_results
-    # ════════════════════════════════════════════════════
-    mapper_human = f"### 用户问题\n{q}\n"
-    if kb_panorama:
-        mapper_human += (
-            f"\n### 知识库全景概要（仅用于确认 KB 准确名称）\n{kb_panorama[:4000]}\n"
-        )
-    mapper_sub = {
-        **state,
-        "ontology_skeleton": render_skeleton_for_mapper(),
-        "messages": [HumanMessage(content=mapper_human)],
-    }
-    mapping = ""
-    try:
-        mapper_llm = get_llm_by_type(AGENT_LLM_MAP.get("ontology_mapper", "basic"))
-        mapper_content = str(
-            (await mapper_llm.ainvoke(
-                apply_prompt_template("ontology_mapper", mapper_sub, configurable)
-            )).content or ""
-        )
-        mapping = extract_ontology_mapping(mapper_content)
-    except Exception as e:
-        logger.warning("ontology_mapper LLM failed: %s", e)
-
-    if mapping:
-        payload_str = mapping
-    else:
-        logger.warning(
-            "ontology_mapper: no valid <ontology_mapping>, fallback to raw KB panorama"
-        )
-        payload_str = json.dumps(
-            [{"query": q, "summary": kb_panorama}] if kb_panorama else [],
-            ensure_ascii=False,
-        )
-
-    return {
-        "background_investigation_results": payload_str,
-        "kb_panorama": kb_panorama,
-        **preserve_state_meta_fields(state),
-    }
-
-
-def planner_node(state: State, config: RunnableConfig) -> Command:
-    """生成计划后跳转 human_feedback（图中无 planner→human_feedback 静态边）。"""
-    configurable = Configuration.from_runnable_config(config)
-    plan_iterations = state.get("plan_iterations", 0)
-    iter_delta = 0 if state.get("skip_next_plan_iteration_increment") else 1
-    max_step_num = (
-        (config.get("configurable") or {}).get("max_step_num")
-        or configurable.max_step_num
-        or 5
-    )
-    wf = state.get("workflow_type", "A")
-    prev_plan = state.get("current_plan")
-    was_replan = bool(state.get("replanning_needed"))
-    last_plan_text = state.get("last_plan_text") or ""
-
-    planner_state: dict = {**state, "workflow_type": wf, "max_step_num": max_step_num}
-    if state.get("enable_clarification", False) and state.get("clarified_research_topic"):
-        modified = {**planner_state, "research_topic": state["clarified_research_topic"]}
-        modified["messages"] = [{"role": "user", "content": state["clarified_research_topic"]}]
-        messages = apply_prompt_template("planner", modified, configurable)
-    else:
-        messages = apply_prompt_template("planner", planner_state, configurable)
-
-    if state.get("enable_background_investigation") and state.get("background_investigation_results"):
-        bg_results = str(state["background_investigation_results"])
-        # P1 修正（2026-06-10）：本体映射 + KB 概要双通道注入。
-        # 本体边=必查维度硬性下限；KB 概要=长尾覆盖 + KB 准确名称权威来源。
-        guardrail = render_planner_guardrail(bg_results)
-        if guardrail:
-            messages += [
-                {
-                    "role": "user",
-                    "content": (
-                        "## 本体映射结果（Ontology Mapping）\n"
-                        + extract_ontology_mapping(bg_results)
-                        + "\n\n"
-                        + guardrail
-                    ),
-                }
-            ]
-        else:
-            messages += [
-                {
-                    "role": "user",
-                    "content": "背景调查参考：\n" + bg_results,
-                }
-            ]
-        # KB 概要独立注入（无论本体映射是否成功，只要有 KB 概要就下发）
-        kb_panorama = state.get("kb_panorama") or ""
-        if kb_panorama.strip():
-            messages += [
-                {
-                    "role": "user",
-                    "content": (
-                        "## 知识库探索概要（KB 准确名称以此为准）\n"
-                        "以下为知识库轻量检索结果，用于：\n"
-                        "1. **KB 准确名称校准**——知识库中的产品/业务准确名称以此为准"
-                        "（优先于本体映射 <kb_terms> 中的名称）\n"
-                        "2. **长尾信息参考**——本体映射覆盖核心骨架（16 类 + 20 边），"
-                        "本体 <unmapped> 之外的长尾业务信息以此为线索安排探索性检索\n\n"
-                        + kb_panorama[:6000]
-                    ),
-                }
-            ]
-    if state.get("replanning_reason"):
-        messages += [
-            {
-                "role": "user",
-                "content": "## 重规划反馈\n"
-                + str(state["replanning_reason"])
-                + "\n请调整检索步骤，避免重复无效路径。",
-            }
-        ]
-    if was_replan and last_plan_text.strip():
-        messages += [
-            {
-                "role": "user",
-                "content": "## 上一版计划（原始文本）\n```\n" + last_plan_text.strip() + "\n```",
-            }
-        ]
-
-        replan_section = ""
-        if is_replan:
-            findings_text = "\n".join(f"- {f}" for f in existing_findings) if existing_findings else "无"
-            replan_section = f"""
-    ## ⚠️ 重新规划（Replan）
-
-    **原因**: {replanning_reason}
-
-    **上一轮计划**:
-    ```
-    {last_plan_text}
-    ```
-
-    **已有发现**:
-    {findings_text}
-
-    **要求**: 针对缺失信息设计补充调研步骤，避免重复已完成的检索。
-    """
-
-    llm = get_llm_by_type(AGENT_LLM_MAP.get("planner", "basic"))
-    full_response = ""
-    for chunk in llm.stream(messages):
-        full_response += chunk.content
-
-    # 注意：不在 planner 阶段做 Plan.model_validate。
-    # 原始计划文本先透传给 human_feedback，便于人类编辑后再做最终校验。
-    candidate_plan_text = full_response
-
-    reset = {
-        "searcher_results": [],
-        "searcher_summaries": [],
-        "curator_rule_splitter_views": [],
-        "atomic_rules": [],
-        "arbitration_result": "",
-        "analyst_output": {},
-        "observations": [],
-        "replanning_needed": False,
-        "replanning_reason": "",
-        "_plan_validator_needs_rerun": False,
-        "planner_override_occurred": False,
-        "structure_validation_retried": False,
-    }
-    update: dict[str, Any] = {
-        **preserve_state_meta_fields(state),
-        "messages": [AIMessage(content=full_response, name="planner")],
-        "current_plan": candidate_plan_text,
-        "current_plan_last_round": prev_plan if was_replan and prev_plan is not None else None,
-        "last_plan_text": full_response,
-        # workflow_type / missing_conditions 在 human_feedback 完成最终校验后再确定
-        "workflow_type": wf,
-        "workflow_confidence": state.get("workflow_confidence", "high"),
-        "plan_iterations": plan_iterations + iter_delta,
-        "skip_next_plan_iteration_increment": False,
-        **reset,
-    }
-    return Command(update=update, goto="human_feedback")
-
-
-def human_feedback_node(
-    state: State, config: RunnableConfig
-) -> Command[Literal["plan_validator", "reporter", "__end__"]]:
-    current_plan = state.get("current_plan", "")
-
-    # if the plan is accepted, run the following node
-    plan_iterations = state["plan_iterations"] if state.get("plan_iterations", 0) else 0
-
-    original_plan = current_plan
-
-    try:
-        # Repair the JSON output
-        current_plan = repair_json_output(current_plan)
-        # parse the plan to dict
-        current_plan = json.loads(current_plan)
-        current_plan_content = extract_plan_content(current_plan)
-        
-        # increment the plan iterations
-        plan_iterations += 1
-        # parse the plan
-        new_plan = json.loads(repair_json_output(current_plan_content))
-        new_plan = _normalize_plan_dict(new_plan)
-    except (json.JSONDecodeError, AttributeError, ValueError) as e:
-        logger.warning(f"Failed to parse plan: {str(e)}. Plan data type: {type(current_plan).__name__}")
-        if isinstance(current_plan, dict) and "content" in original_plan:
-            logger.warning(f"Plan appears to be an AIMessage object with content field")
-        if plan_iterations > 1:  # the plan_iterations is increased before this check
-            return Command(
-                update=preserve_state_meta_fields(state),
-                goto="reporter"
-            )
-        else:
-            return Command(
-                update=preserve_state_meta_fields(state),
-                goto="__end__"
-            )
-
-    if not new_plan:
-        return Command(
-            update=preserve_state_meta_fields(state),
-            goto="__end__"
-        )
-
-    current_plan = Plan.model_validate(new_plan)
-    for s in _plan_steps(current_plan):
-        s.execution_res = None
-
-    # Build update dict with safe locale handling
-    update_dict = {
-        "current_plan": current_plan,
-        "plan_iterations": plan_iterations,
-        "workflow_type": getattr(current_plan, "workflow_type", None) or state.get("workflow_type", "A"),
-        "missing_conditions": list(getattr(current_plan, "missing_conditions", []) or []),
-        **preserve_state_meta_fields(state),
-    }
-    
-    # Only override locale if new_plan provides a valid value, otherwise use preserved locale
-    if new_plan.get("locale"):
-        update_dict["locale"] = new_plan["locale"]
-    
-    return Command(
-        update=update_dict,
-        goto="plan_validator",
-    )
-
-
-def plan_validator_node(state: State, config: RunnableConfig) -> dict:
-    plan = state.get("current_plan")
-    coord_wf = state.get("workflow_type", "A")
-    base = {**preserve_state_meta_fields(state), "_plan_validator_needs_rerun": False}
-
-    if plan is None:
-        return {
-            **base,
-            "workflow_type": state.get("workflow_type", "A"),
-            "workflow_confidence": state.get("workflow_confidence", "high"),
-            "_plan_validator_needs_rerun": True,
-            "skip_next_plan_iteration_increment": True,
-        }
-
-    plan_wf = getattr(plan, "workflow_type", None) or coord_wf
-    if plan_wf != coord_wf and not state.get("planner_override_occurred", False):
-        return {
-            **base,
-            "workflow_type": plan_wf,
-            "planner_override_occurred": True,
-            "_plan_validator_needs_rerun": True,
-            "skip_next_plan_iteration_increment": True,
-            "current_plan": None,
-        }
-
-    ok, err = validate_plan_structure(plan, plan_wf)
-    if not ok:
-        logger.warning("Plan structure invalid: %s", err)
-        if not state.get("structure_validation_retried", False):
-            return {
-                **base,
-                "workflow_type": "A",
-                "structure_validation_retried": True,
-                "_plan_validator_needs_rerun": True,
-                "skip_next_plan_iteration_increment": True,
-                "current_plan": None,
-            }
-
-    plan_text = json.dumps(plan.model_dump(), ensure_ascii=False, indent=2)
-
-    return {
-        **base,
-        "last_plan_text": plan_text,
-        "workflow_type": state.get("workflow_type", "A"),
-        "workflow_confidence": state.get("workflow_confidence", "high"),
-    }
-
-
-async def coordinator_node(state: State, config: RunnableConfig) -> Command:
-    configurable = Configuration.from_runnable_config(config)
-    locale = state.get("locale", "zh_CN")
-    agent = create_agent(
-        "coordinator",
-        "coordinator",
-        [handoff_to_planner, handoff_after_clarification],
-        "coordinator",
-        interrupt_before_tools=configurable.interrupt_before_tools,
-        locale=locale,
-    )
-    extra: list = []
-    if not state.get("enable_clarification", False):
-        extra.append(
-            HumanMessage(
-                content="[系统] 不进行多轮澄清时请直接 handoff_to_planner，并填写 workflow_type / workflow_confidence。"
-            )
-        )
-    
-    result = await agent.ainvoke(
-        {"messages": (state.get("messages") or []) + extra},
-        config={"recursion_limit": 25},
-    )
-    msgs = result.get("messages", [])
-    last = _last_ai_message(msgs)
-    if not last:
-        # 无有效回复时保持在澄清回合，避免错误直跳下游
-        return Command(
-            update={**preserve_state_meta_fields(state), "messages": msgs},
-            goto=END,
-        )
-
-    calls = getattr(last, "tool_calls", None) or []
-    if calls:
-        args = calls[0].get("args") or {}
-        wf = (args.get("workflow_type") or "A").strip().upper()[:1] or "A"
-        if wf not in {"A", "B", "C", "D"}:
-            wf = "A"
-        wconf = (args.get("workflow_confidence") or "medium").lower()
-        if wconf not in ("high", "medium", "low"):
-            wconf = "medium"
-        topic = (args.get("research_topic") or state.get("research_topic", "")).strip()
-        clar = reconstruct_clarification_history(
-            msgs,
-            fallback_history=state.get("clarification_history", []),
-            base_topic=state.get("research_topic", ""),
-        )
-        _, latest_u = get_latest_user_message(msgs)
-        if latest_u and (not clar or clar[-1] != latest_u):
-            clar = clar + [latest_u] if clar else [latest_u]
-        clarified = topic or state.get("research_topic", "")
-        orig = (state.get("original_topic") or "").strip() or state.get("research_topic", "")
-        return Command(
-            update={
-                **preserve_state_meta_fields(state),
-                "messages": msgs,
-                "research_topic": state.get("research_topic", topic) or topic,
-                "original_topic": orig,
-                "clarified_research_topic": clarified,
-                "clarification_history": clar,
-                "workflow_type": wf,
-                "workflow_confidence": wconf,
-                "is_clarification_complete": True,
-            },
-            goto="background_investigator",
-        )
-
-    text = (get_message_content(last) or "").strip()
-    if not text:
-        return Command(
-            update={**preserve_state_meta_fields(state), "messages": msgs},
-            goto=END,
-        )
-
-    # 未触发 handoff 说明 coordinator 仍在澄清。
-    # 达到最大澄清轮次后自动收敛，沿用已知信息继续下游。
-    enable_clarification = state.get("enable_clarification", False)
-    current_rounds = state.get("clarification_rounds", 0) + 1
-    max_rounds = state.get("max_clarification_rounds", 3)
-    if enable_clarification and current_rounds > max_rounds:
-        clar = reconstruct_clarification_history(
-            msgs,
-            fallback_history=state.get("clarification_history", []),
-            base_topic=state.get("research_topic", ""),
-        )
-        clarified_topic, _ = build_clarified_topic_from_history(clar)
-        topic = clarified_topic or state.get("clarified_research_topic") or state.get("research_topic", "")
-        return Command(
-            update={
-                **preserve_state_meta_fields(state),
-                "messages": msgs,
-                "clarification_history": clar,
-                "clarification_rounds": current_rounds,
-                "is_clarification_complete": True,
-                "clarified_research_topic": topic,
-                "workflow_type": state.get("workflow_type", "A"),
-                "workflow_confidence": state.get("workflow_confidence", "low"),
-            },
-            goto="background_investigator",
-        )
-
-    return Command(
-        update={
-            **preserve_state_meta_fields(state),
-            "messages": msgs,
-            "clarification_rounds": current_rounds,
-            "is_clarification_complete": False,
-        },
-        goto=END,
-    )
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  5. Searcher Node 集成示例
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-async def researcher_node(state: dict) -> dict:
-    """
-    Searcher 节点：执行 ReAct agent，缓存工具返回，格式化输出。
-
-    返回更新 State 的字段：
-    - searcher_results:         Curator 的原始工具返回 Markdown（追加当前步骤）
-    - searcher_summaries:       Searcher 检索摘要文本（追加当前步骤）
-    - document_chunk_maps:      全局文档 chunk_map 累积（合并更新）
-    - document_metadata:        全局文档元数据累积（合并更新）
-    """
-    current_step = None
-    complete_steps = []
-    plan = state.get("current_plan")
-    for step in plan.steps:
-        if not step.execution_res:
-            current_step = step
-        else:
-            complete_steps.append(step)
-
-    searcher_results = state.get("searcher_results")
-
-    complete_step_info = ""
-    step_index = 1
-    for searcher_result, _ in searcher_results:
-        complete_step_info += f"# 已完成步骤{step_index}-检索\n\n{searcher_result}\n\n"
-
-    q = state.get("clarified_research_topic") or state.get("research_topic", "")
-
-    user = (
-        f"## 调查原始问题\n{q}\n\n## 工作流类型\n{wf_label}\n\n"
-        f"## 已完成步骤检索摘要\n{summaries}\n\n"
-        f"## 当前步骤\n- 标题：{step.title}\n- 背景：{step.background}\n- 检索内容：{step.description}\n"
-    )
-
-    tool_returns_cache: list[ToolCallRecord] = []
-
-    llm_limit = get_llm_token_limit_by_type(
-        AGENT_LLM_MAP.get("researcher", "basic")
-    )
-
-    middleware = [
-        # ① 先执行：缓存 ToolMessage artifact
-        PreModelHookMiddleware(make_tool_saver_hook(tool_returns_cache)),
-        # ② 后执行：消息压缩（可能删除旧 ToolMessage）
-        PreModelHookMiddleware(partial(
-            ContextManager(llm_limit, 3).compress_messages
-        )),
-    ]
-
-    hook = partial(ContextManager(llm_limit, 3).compress_messages)
-
-    tools = [t for t in [get_retriever_tool(state.get("resources", [])), crawl_tool] if t]
-
-    agent = create_agent(
-        name="searcher",
-        model=llm_model,
-        tools=tools,
-        hook=hook,
-        middleware=middleware,
-    )
-
-    result = await agent.astream(state["messages"])
-
-    # Curator 输入
-    curator_tool_input = format_tool_cache_for_curator(tool_returns_cache, current_step.title)
-
-    # Chunk maps（全局累积）
-    new_chunk_maps = extract_chunk_maps_from_cache(tool_returns_cache)
-    existing_maps = state.get("document_chunk_maps", {})
-    for doc_title, cmap in new_chunk_maps.items():
-        if doc_title in existing_maps:
-            existing_maps[doc_title].update(cmap)
-        else:
-            existing_maps[doc_title] = cmap
-
-    # Document metadata（全局累积）
-    new_metadata = extract_document_metadata_from_cache(tool_returns_cache)
-    existing_metadata = state.get("document_metadata", {})
-    existing_metadata.update(new_metadata)
-
-    # Citations（跨步骤 merge）
-    new_citations = extract_citations_from_cache(tool_returns_cache)
-    existing_citations = state.get("citations", [])
-    merged_citations = merge_citations(existing_citations, new_citations)
-
-    return {
-        "messages": result["messages"],
-        # Curator 输入：Markdown 格式的工具返回
-        "searcher_results": [curator_tool_input],
-        # Searcher 检索摘要（从 agent 最终文本输出提取）
-        "searcher_summaries": [result],
-        # 全局 chunk_map 累积
-        "document_chunk_maps": existing_maps,
-        # 全局文档元数据累积
-        "document_metadata": existing_metadata,
-        "citations": merged_citations,
-    }
-
-
-async def curator_node(state: State, config: RunnableConfig) -> dict:
-    configurable = Configuration.from_runnable_config(config)
-    plan = state.get("current_plan")
-    step = _first_research_step_pending_curator(plan)
-    if step is None:
-        return {**preserve_state_meta_fields(state)}
-
-    rs = _research_steps(plan)
-    idx = next((i + 1 for i, s in enumerate(rs) if s is step), 0)
-    latest_raw = (state.get("searcher_results", []) or [])[-1] if state.get("searcher_results") else ""
-    q = state.get("clarified_research_topic") or state.get("research_topic", "")
-    human = (
-        f"### 调查原始问题\n{q}\n\n### 当前步骤\n"
-        f"- 标题：{step.title}\n- 背景：{step.background}\n- 评估内容：{step.description}\n\n"
-        f"### 检索摘要\n{step.execution_res}\n\n### 原始工具返回\n{latest_raw}\n"
-    )
-    sub = {**state, "messages": [HumanMessage(content=human)]}
-    llm = get_llm_by_type(AGENT_LLM_MAP.get("curator", "basic"))
-    content = str((await llm.ainvoke(apply_prompt_template("curator", sub, configurable))).content or "")
-
-    # ── P0: 解析 CuratorOutput → 从 chunk_map 重建段落原文 → 生成 resolved 视图 ──
-    resolved_view = None
-    try:
-        curator_output = parse_curator_output(content)
-        chunk_maps = state.get("document_chunk_maps", {})
-        if chunk_maps:
-            resolved_list = resolve_all_evidence_chunks(curator_output, chunk_maps)
-            resolved_view = generate_rule_splitter_view(curator_output, resolved_list)
-    except Exception as e:
-        logger.warning("P0 视图生成失败，回退至原始 JSON: %s", e)
-
-    # ── 回退路径：原始 JSON（解析失败或无 chunk_map 时）──
-    parsed = _parse_json_object(content)
-    full = json.dumps(parsed, ensure_ascii=False, indent=2) if parsed else content
-    summary = _generate_searcher_summary(
-        step.title, step.description, parsed if isinstance(parsed, dict) else {}
-    )
-    step.execution_res = f"{_CURATOR_TAG}\n{full}"
-
-    # 优先使用 resolved 视图（含 chunk_map 原文），否则回退到原始 JSON
-    view_content = resolved_view if resolved_view else full
-    views = list(state.get("curator_rule_splitter_views", [])) + [
-        f"### 步骤 {idx} 信息质量评估\n{view_content}"
-    ]
-    sums = list(state.get("searcher_summaries", [])) + [summary]
-    return {
-        **preserve_state_meta_fields(state),
-        "current_plan": plan,
-        "curator_rule_splitter_views": views,
-        "searcher_summaries": sums,
-    }
-
-
-async def rule_splitter_node(state: State, config: RunnableConfig) -> dict:
-    configurable = Configuration.from_runnable_config(config)
-    plan = state.get("current_plan")
-    step = _first_research_step_pending_rule_splitter(plan)
-    if step is None or _RULE_DONE in (step.execution_res or ""):
-        return {**preserve_state_meta_fields(state), "current_plan": plan}
-
-    views = state.get("curator_rule_splitter_views", [])
-    if not views:
-        return {**preserve_state_meta_fields(state), "current_plan": plan}
-
-    q = state.get("clarified_research_topic") or state.get("research_topic", "")
-    human = f"### 调查原始问题\n{q}\n\n### 信息质量评估\n{views[-1]}\n"
-    sub = {**state, "messages": [HumanMessage(content=human)]}
-    llm = get_llm_by_type(AGENT_LLM_MAP.get("rule_splitter", "basic"))
-    rules = str((await llm.ainvoke(apply_prompt_template("rule_splitter", sub, configurable))).content or "")
-    er = step.execution_res or ""
-    if _RULE_DONE not in er:
-        step.execution_res = f"{er.rstrip()}\n\n{_RULE_DONE}"
-    atoms = list(state.get("atomic_rules", [])) + [rules]
-    return {
-        **preserve_state_meta_fields(state),
-        "current_plan": plan,
-        "atomic_rules": atoms,
-    }
-
-
-async def arbitrator_node(state: State, config: RunnableConfig) -> dict:
-    configurable = Configuration.from_runnable_config(config)
-    atoms = state.get("atomic_rules", [])
-    if not atoms:
-        return {
-            **preserve_state_meta_fields(state),
-            "arbitration_result": "无原子规则可供仲裁。",
-        }
-    wf = state.get("workflow_type", "A")
-    labels = {"A": "A 定点调查", "B": "B 并行对比", "C": "C 扫描穷举", "D": "D 条件推理"}
-    q = state.get("clarified_research_topic") or state.get("research_topic", "")
-    blob = "\n\n---\n\n".join(f"#### {i + 1}\n{t}" for i, t in enumerate(atoms))
-    human = (
-        f"### 调查原始问题\n{q}\n\n"
-        f"### 当前工作流类型\n{labels.get(wf, wf)}\n\n"
-        f"### 关联业务原子规则清单\n{blob}\n"
-    )
-    sub = {
-        **state,
-        "arbitrator_bucketing_guide": render_arbitrator_bucketing_guide(),
-        "messages": [HumanMessage(content=human)],
-    }
-    llm = get_llm_by_type(AGENT_LLM_MAP.get("arbitrator", "basic"))
-    out = str((await llm.ainvoke(apply_prompt_template("arbitrator", sub, configurable))).content or "")
-    return {**preserve_state_meta_fields(state), "arbitration_result": out.strip()}
-
-
-async def analyst_node(state: State, config: RunnableConfig) -> dict:
-    configurable = Configuration.from_runnable_config(config)
-    plan = state.get("current_plan")
-    analysis_step = _first_analysis_step_pending_analyst(plan)
-    views = "\n\n".join(state.get("curator_rule_splitter_views", []))
-    q = state.get("clarified_research_topic") or state.get("research_topic", "")
-    wf = state.get("workflow_type", "A")
-    replan_it = state.get("replan_iterations", 0)
-    missing_block = ""
-    if wf == "D":
-        miss = state.get("missing_conditions", [])
-        miss_txt = "\n".join(f"- {m}" for m in miss) if miss else "（无）"
-        missing_block = f"### 未提供关键条件（D）\n{miss_txt}\n\n"
-    replan_limit_block = ""
-    if replan_it > 1:
-        replan_limit_block = (
-            "### 重规划次数提示\n"
-            f"当前 replan_iterations={replan_it}，已达到重规划上限。\n"
-            "请基于现有证据直接输出最佳可得结论与局限性说明，"
-            "不要再输出 `replanning_needed=true`。\n\n"
-        )
-    human = (
-        f"### 调查原始问题\n{q}\n\n"
-        f"{missing_block}"
-        f"{replan_limit_block}"
-        f"### 信息质量评估（各步）\n{views or '（无）'}\n\n"
-        f"### 仲裁报告\n{state.get('arbitration_result', '（无）')}\n\n"
-        f"### 分析步骤\n- 标题：{getattr(analysis_step, 'title', '')}\n"
-        f"- 背景：{getattr(analysis_step, 'background', '')}\n"
-        f"- 要求：{getattr(analysis_step, 'description', '')}\n"
-    )
-    sub = {**state, "messages": [HumanMessage(content=human)], "workflow_type": wf}
-    llm = get_llm_by_type(AGENT_LLM_MAP.get("analyst", "basic"))
-    text = str((await llm.ainvoke(apply_prompt_template("analyst", sub, configurable))).content or "").strip()
-    parsed = _parse_analyst_output(text)
-    replan = bool(parsed and (parsed.get("replanning_needed") or parsed.get("replanningNeeded")))
-    low = text.lower()
-    if not replan and '"replanning_needed": true' in low:
-        replan = True
-    reason = ""
-    if isinstance(parsed, dict):
-        reason = str(parsed.get("replanning_reason") or parsed.get("gap_analysis") or "")
-
-    if analysis_step is not None:
-        analysis_step.execution_res = "Analyst 已完成。"
-
-    obs = list(state.get("observations", [])) + ([text] if text else [])
-    replan_it = replan_it + (1 if replan else 0)
-    return {
-        **preserve_state_meta_fields(state),
-        "current_plan": plan,
-        "observations": obs,
-        "analyst_output": parsed if isinstance(parsed, dict) else {},
-        "replanning_needed": replan,
-        "replanning_reason": reason or state.get("replanning_reason", ""),
-        "replan_iterations": replan_it,
-    }
-
-
-def _render_comparison_table_md(table: dict[str, Any]) -> str:
-    """将 analyst 的 comparison_table JSON 结构渲染为 Markdown 表格。
-
-    期望结构：{"dimensions": [...], "objects": {"对象A": {维度: 值}}, "key_differences": [...]}
-    objects 的值兼容 dict（按维度取值）和 list（按维度顺序对位）两种形态。
-    """
-    dims = [str(d) for d in (table.get("dimensions") or [])]
-    objects = table.get("objects") or {}
-    if not dims or not isinstance(objects, dict) or not objects:
-        return ""
-
-    obj_names = [str(k) for k in objects.keys()]
-    lines = [
-        "| 对比维度 | " + " | ".join(obj_names) + " |",
-        "|:---|" + "|".join([":---"] * len(obj_names)) + "|",
-    ]
-    for i, dim in enumerate(dims):
-        row = [dim]
-        for name in obj_names:
-            vals = objects.get(name)
-            cell = ""
-            if isinstance(vals, dict):
-                cell = str(vals.get(dim, "知识库中未查到"))
-            elif isinstance(vals, list):
-                cell = str(vals[i]) if i < len(vals) else "知识库中未查到"
-            elif vals is not None:
-                cell = str(vals)
-            row.append(cell.replace("\n", " ").replace("|", "／") or "知识库中未查到")
-        lines.append("| " + " | ".join(row) + " |")
-
-    diffs = table.get("key_differences") or []
-    if diffs:
-        lines.append("")
-        lines.append("**关键差异**：")
-        for d in diffs:
-            lines.append(f"- {d}")
-    return "\n".join(lines)
-
-
-def _render_analyst_observation_for_reporter(
-    parsed: dict[str, Any], wf: str
-) -> str:
-    """
-    将 analyst_output（已解析 dict）程序化渲染为 reporter 可直接阅读的
-    分节 Markdown，替代向 reporter 注入原始 JSON 文本。
-
-    渲染失败/字段缺失均逐节降级，不抛异常。
-    """
-    parts: list[str] = []
-
-    sc = parsed.get("scope_coverage") or {}
-    if isinstance(sc, dict) and sc:
-        parts.append(
-            "### 调查覆盖范围\n"
-            f"- 完整范围（full_scope）：{'、'.join(map(str, sc.get('full_scope') or [])) or '（不适用）'}\n"
-            f"- 已覆盖（covered）：{'、'.join(map(str, sc.get('covered') or [])) or '（不适用）'}\n"
-            f"- 未覆盖（not_covered）：{'、'.join(map(str, sc.get('not_covered') or [])) or '无'}"
-        )
-
-    conf = parsed.get("overall_confidence")
-    if conf:
-        parts.append(f"### 整体置信度\n{conf}")
-
-    unc = parsed.get("uncovered_aspects") or []
-    if unc:
-        parts.append("### 未覆盖方面\n" + "\n".join(f"- {u}" for u in unc))
-
-    conclusions = parsed.get("conclusions") or []
-    if conclusions:
-        c_lines = ["### 业务结论"]
-        for i, c in enumerate(conclusions, 1):
-            if not isinstance(c, dict):
-                c_lines.append(f"{i}. {c}")
-                continue
-            line = f"{i}. {c.get('statement', '')}（置信度：{c.get('confidence', '')}）"
-            srcs = c.get("supporting_sources") or []
-            if srcs:
-                line += f"\n   - 支撑来源：{'、'.join(f'《{s}》' for s in srcs)}"
-            conds = c.get("conditions")
-            if conds:
-                line += f"\n   - 条件前提：{'；'.join(map(str, conds))}"
-            if c.get("scope_note"):
-                line += f"\n   - 范围说明：{c['scope_note']}"
-            if c.get("expired_only"):
-                line += "\n   - ⚠️ 该结论仅基于已过期依据，仅供历史参考"
-            c_lines.append(line)
-        parts.append("\n".join(c_lines))
-
-    # ── 工作流特定结构 ──
-    if wf == "B":
-        table = parsed.get("comparison_table")
-        if isinstance(table, dict):
-            md = _render_comparison_table_md(table)
-            if md:
-                parts.append("### 对比表格（已渲染）\n" + md)
-    elif wf == "C":
-        enum = parsed.get("enumeration_list")
-        if isinstance(enum, dict) and enum:
-            e_lines = ["### 穷举列表"]
-            if enum.get("condition"):
-                e_lines.append(f"- 穷举条件：{enum['condition']}")
-            for label, key in (
-                ("已确认项目", "confirmed_items"),
-                ("存疑项目", "uncertain_items"),
-                ("仅过期来源项目", "expired_source_items"),
-            ):
-                items = enum.get(key) or []
-                if items:
-                    e_lines.append(f"- {label}：")
-                    e_lines.extend(f"  - {it}" for it in items)
-            if enum.get("completeness_note"):
-                e_lines.append(f"- 完备性说明：{enum['completeness_note']}")
-            parts.append("\n".join(e_lines))
-    elif wf == "D":
-        chain = parsed.get("condition_chain")
-        if isinstance(chain, dict) and chain:
-            d_lines = ["### 条件推理链"]
-            if chain.get("target"):
-                d_lines.append(f"- 判定目标：{chain['target']}")
-            conds = chain.get("conditions") or []
-            if conds:
-                d_lines.append("- 条件清单：")
-                d_lines.extend(f"  - {c}" for c in conds)
-            if chain.get("reasoning_summary"):
-                d_lines.append(f"- 推理概述：{chain['reasoning_summary']}")
-            negs = chain.get("negative_rules") or []
-            if negs:
-                d_lines.append("- 否定性规则：")
-                d_lines.extend(f"  - {n}" for n in negs)
-            parts.append("\n".join(d_lines))
-
-    for title, key, empty_hint in (
-        ("分析过程", "analysis_text", "（无）"),
-        ("矛盾信息处理", "contradiction_text", "未发现矛盾信息。"),
-        ("风险提示", "risk_text", "未发现需要提示的风险。"),
-    ):
-        parts.append(f"### {title}\n{parsed.get(key) or empty_hint}")
-
-    return "\n\n".join(parts)
-
-
-async def reporter_node(state: State, config: RunnableConfig) -> dict:
-    configurable = Configuration.from_runnable_config(config)
-    plan = state.get("current_plan")
-    wf = state.get("workflow_type", "A")
-    thought = getattr(plan, "thought", "") if plan else ""
-
-    # ── 分析结论：优先消费已解析的 analyst_output（程序化渲染分节 Markdown），
-    #    解析失败时回退到 observations 原文（旧行为） ──
-    analyst_parsed = state.get("analyst_output") or {}
-    if isinstance(analyst_parsed, dict) and analyst_parsed.get("conclusions"):
-        obs_text = _render_analyst_observation_for_reporter(analyst_parsed, wf)
-    else:
-        observations = list(state.get("observations", []))
-        obs_text = "\n\n---\n\n".join(observations)
-
-    citations = [c for c in (state.get("citations") or []) if isinstance(c, dict)]
-    citations_section = format_citations_for_reporter(citations)
-
-    q = state.get("clarified_research_topic") or state.get("research_topic", "")
-    human = (
-        f"## 1. 调查原始问题\n{q}\n\n"
-        f"## 2. 调查计划制定思路\n{thought or '（无）'}\n\n"
-        f"## 3. 分析结论\n{obs_text or '（无）'}\n\n"
-        f"## 4. 可用参考来源\n{citations_section}\n"
-    )
-    sub = {**state, "workflow_type": wf, "messages": [HumanMessage(content=human)]}
-    msgs = apply_prompt_template("reporter", sub, configurable)
-    lim = get_llm_token_limit_by_type(AGENT_LLM_MAP.get("reporter", "basic"))
-    comp = ContextManager(lim).compress_messages({"messages": msgs})
-    llm = get_llm_by_type(AGENT_LLM_MAP.get("reporter", "basic"))
-    report = str(llm.invoke(comp.get("messages", msgs)).content or "").strip()
-    return {
-        **preserve_state_meta_fields(state),
-        "final_report": report,
-        "citations": citations,
-        "replan_iterations": 0,
-    }
-
-
-def validate_plan_structure(plan: Any, workflow_type: str) -> tuple[bool, str]:
-    """
-    纯代码校验 Plan 结构是否符合声称的 workflow_type。
-    不做语义判断，只检查结构特征。
-
-    Returns:
-        (is_valid, error_message)
-    """
-    if plan is None:
-        return False, "Plan is None"
-
-    steps = getattr(plan, "steps", [])
-    research_steps = [s for s in steps if getattr(s, "step_type", "") == "research"]
-    analysis_steps = [s for s in steps if getattr(s, "step_type", "") == "analysis"]
-
-    # ── 通用校验 ──
-    if not steps:
-        return False, "Plan has no steps"
-
-    if not analysis_steps:
-        return False, "Plan missing analysis step"
-
-    if getattr(analysis_steps[-1], "step_type", "") != "analysis":
-        return False, "Last step is not analysis"
-
-    if not research_steps:
-        return False, "Plan has no research steps"
-
-    # ── 工作流 B 校验：≥2 research step + 维度对齐 ──
-    if workflow_type == "B":
-        if len(research_steps) < 2:
-            return False, (
-                f"Workflow B requires ≥2 research steps, got {len(research_steps)}"
-            )
-
-    # ── 工作流 C 校验：≥2 不同角度的 research step ──
-    elif workflow_type == "C":
-        if len(research_steps) < 2:
-            return False, (
-                f"Workflow C requires ≥2 scan angles, got {len(research_steps)}"
-            )
-
-    # ── 工作流 D 校验：有否定条款检索 step ──
-    elif workflow_type == "D":
-        negative_keywords = ["例外", "禁止", "不适用", "不予", "除外", "限制"]
-        has_negative_step = any(
-            any(kw in getattr(s, "description", "") for kw in negative_keywords)
-            for s in research_steps
-        )
-        if not has_negative_step:
-            logger.warning("Workflow D: missing negative/exception clause search step")
-
-        # missing_conditions 空值为 soft warning（用户可能提供了全部条件）
-        missing = getattr(plan, "missing_conditions", [])
-        if not missing:
-            logger.warning(
-                "Workflow D: missing_conditions is empty. "
-                "This may be correct if user provided all conditions."
-            )
-
-    return True, ""
-
-
-"""
-Tool return pipeline: data models → tool formatters → hook → post-processing.
-
-Unified data flow:
-  Tool execution → ToolMessage(content=Markdown, artifact=structured) 
-    → Hook captures artifact into cache
-    → Searcher node end: format cache → Curator input + chunk_maps for State
-"""
-
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  1. 统一数据模型
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class ToolChunk(BaseModel):
-    """工具返回中的单个文档片段/段落。"""
-    chunk_index: str
-    chunk_content: str
-
-
-class ToolDocumentReturn(BaseModel):
-    """单个文档维度的工具返回数据。三种工具共用此结构。"""
-    document_title: str
-    document_url: str | None = None
-    file_id: str | None = None
-    description: str | None = None       # local_search 的 description 元数据
-
-    chunks: list[ToolChunk] = Field(default_factory=list)
-
-    # ── 截取元数据（仅 crawl/fetch 有值）──
-    is_extracted: bool = False            # True = 执行了截取
-    chunk_map: dict[str, str] | None = None  # 全量 chunk_index → content 映射
-
-
-class ToolCallArtifact(BaseModel):
-    """单次工具调用的结构化 artifact，存入 ToolMessage.artifact。"""
-    tool_type: str                        # "local_search" | "crawl" | "fetch"
-    documents: list[ToolDocumentReturn] = Field(default_factory=list)
-
-
-class ToolCallRecord(BaseModel):
-    """Hook 缓存中的单条记录。"""
-    call_index: int
-    tool_name: str
-    content_md: str                       # Searcher 可见的 Markdown
-    artifact: ToolCallArtifact | None = None
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  2. 工具输出格式化器
-#     每个工具调用这些函数来构造 (content, artifact) 元组
-#     配合 @tool(response_format="content_and_artifact") 使用
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# ── 2a. local_search_tool ─────────────────────────
-
-def format_local_search_return(
-    raw_results: list[dict],
-) -> tuple[str, dict]:
-    """
-    将 local_search 的原始结果格式化为 (content_md, artifact_dict)。
-
-    raw_results 的期望结构（来自向量数据库）：
-    [
-        {
-            "document_title": "信用卡分期业务管理办法",
-            "document_url": "http://...",
-            "file_id": "000001-000001",
-            "description": "总行指引",
-            "chunk_index": "3",
-            "chunk_content": "白金卡账单分期手续费率...",
-            "score": 0.85,
-        },
-        ...
-    ]
-    """
-    # ── 按文档分组 ──
-    doc_groups: dict[str, dict] = {}
-    for r in raw_results:
-        title = r.get("document_title", "未知文档")
-        if title not in doc_groups:
-            doc_groups[title] = {
-                "document_title": title,
-                "document_url": r.get("document_url"),
-                "file_id": r.get("file_id"),
-                "description": r.get("description"),
-                "chunks": [],
-            }
-        doc_groups[title]["chunks"].append({
-            "chunk_index": str(r.get("chunk_index", "")),
-            "chunk_content": r.get("chunk_content", ""),
-        })
-
-    # ── 构建 content_md（Searcher 可见）──
-    md_parts: list[str] = []
-    artifact_docs: list[ToolDocumentReturn] = []
-
-    for doc_idx, (title, doc_data) in enumerate(doc_groups.items(), 1):
-        # Markdown header
-        url_part = f" | url: {doc_data['document_url']}" if doc_data["document_url"] else ""
-        fid_part = f" | 编号: {doc_data['file_id']}" if doc_data["file_id"] else ""
-        desc_part = f" | {doc_data['description']}" if doc_data["description"] else ""
-        md_parts.append(
-            f"**文档 {doc_idx}** — 《{title}》{desc_part}{url_part}{fid_part}"
-        )
-        md_parts.append("")
-
-        chunks = doc_data["chunks"]
-        tool_chunks: list[ToolChunk] = []
-
-        for chunk in chunks:
-            idx = chunk["chunk_index"]
-            content = chunk["chunk_content"].strip()
-            md_parts.append(f"**[{idx}]**\n{content}")
-            md_parts.append("")
-            tool_chunks.append(ToolChunk(chunk_index=idx, chunk_content=content))
-
-        md_parts.append("---")
-        md_parts.append("")
-
-        artifact_docs.append(ToolDocumentReturn(
-            document_title=title,
-            document_url=doc_data["document_url"],
-            file_id=doc_data["file_id"],
-            description=doc_data["description"],
-            chunks=tool_chunks,
-            is_extracted=False,
-            chunk_map=None,
-        ))
-
-    content_md = "\n".join(md_parts).strip()
-    artifact = ToolCallArtifact(tool_type="local_search", documents=artifact_docs)
-
-    return content_md, artifact.model_dump()
-
-
-# ── 2b. crawl_tool / fetch_tool ──────────────────
-
-def format_crawl_fetch_return(
-    extraction_result: ExtractionResult,
-    tool_type: str = "crawl",
-    document_url: str | None = None,
-    file_id: str | None = None,
-    description: str | None = None,
-) -> tuple[str, dict]:
-    """
-    将 ExtractionResult 格式化为 (content_md, artifact_dict)。
-
-    Args:
-        extraction_result: 截取模块的输出。
-        tool_type: "crawl" 或 "fetch"。
-        document_url: 文档 URL。
-        file_id: 知识库文档编号。
-        description: 文档分类描述。
-    """
-    # ── content_md: Searcher 可见 ──
-    if extraction_result.is_extracted:
-        content_md = extraction_result.extracted_text_md
-    else:
-        content_md = extraction_result.full_text_md
-
-    # ── artifact: 结构化数据 ──
-    tool_chunks = [
-        ToolChunk(chunk_index=ec.chunk_index, chunk_content=ec.chunk_content)
-        for ec in extraction_result.extracted_chunks
-    ]
-
-    doc = ToolDocumentReturn(
-        document_title=extraction_result.document_title,
-        document_url=document_url,
-        file_id=file_id,
-        description=description,
-        chunks=tool_chunks,
-        is_extracted=extraction_result.is_extracted,
-        chunk_map=extraction_result.chunk_map if extraction_result.chunk_map else None,
-    )
-
-    artifact = ToolCallArtifact(tool_type=tool_type, documents=[doc])
-
-    return content_md, artifact.model_dump()
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  3. Hook：拦截 ToolMessage，解析 artifact 存入缓存
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def make_tool_saver_hook(cache: list[ToolCallRecord]):
-    """
-    PreModelHook：每次模型调用前扫描 messages，
-    将新出现的 ToolMessage 的 artifact 存入旁路缓存。
-
-    执行顺序：先于 ContextManager（确保消息被压缩前已缓存）。
-    """
-    seen_ids: set[str] = set()
-
-    def hook(messages: list) -> list:
-        for msg in messages:
-            if not isinstance(msg, ToolMessage):
-                continue
-
-            msg_id = msg.id or str(id(msg))
-            if msg_id in seen_ids:
-                continue
-            seen_ids.add(msg_id)
-
-            # 解析 artifact
-            raw_artifact = getattr(msg, "artifact", None)
-            parsed_artifact = None
-
-            if raw_artifact is not None:
-                try:
-                    if isinstance(raw_artifact, dict):
-                        parsed_artifact = ToolCallArtifact.model_validate(raw_artifact)
-                    elif isinstance(raw_artifact, ToolCallArtifact):
-                        parsed_artifact = raw_artifact
-                except Exception as e:
-                    logger.warning("Failed to parse tool artifact: %s", e)
-
-            content_md = (
-                msg.content if isinstance(msg.content, str)
-                else json.dumps(msg.content, ensure_ascii=False)
-            )
-
-            cache.append(ToolCallRecord(
-                call_index=len(cache) + 1,
-                tool_name=getattr(msg, "name", None) or "unknown",
-                content_md=content_md,
-                artifact=parsed_artifact,
-            ))
-
-        return messages  # 原样返回，不改动消息
-
-    return hook
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  4. Searcher 节点尾部处理
-#     将缓存转化为 Curator 输入 + 提取 chunk_maps
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-TOOL_NAME_DISPLAY = {
-    "local_search_tool": "语义检索",
-    "crawl_tool": "全文获取(url)",
-    "fetch_tool": "全文获取(文档名)",
-}
-
-
-def format_tool_cache_for_curator(
-    cache: list[ToolCallRecord],
-    step_title: str = "",
-) -> str:
-    """
-    将缓存的全部工具调用格式化为 Curator 的"原始工具返回"输入。
-
-    输出格式（Markdown）：
-    === 第1次调用（local_search_tool / 语义检索）===
-    [content_md from tool]
-
-    === 第2次调用（crawl_tool / 全文获取）===
-    [content_md from tool]
-    """
-    if not cache:
-        return "（本步骤未执行任何工具调用）"
-
-    parts: list[str] = []
-    if step_title:
-        parts.append(f"## {step_title} 的原始工具返回\n")
-
-    for record in cache:
-        display_name = TOOL_NAME_DISPLAY.get(record.tool_name, record.tool_name)
-        parts.append(
-            f"=== 第{record.call_index}次调用（{record.tool_name} / {display_name}）==="
-        )
-        parts.append("")
-        parts.append(record.content_md)
-        parts.append("")
-
-    return "\n".join(parts).strip()
-
-
-def extract_chunk_maps_from_cache(
-    cache: list[ToolCallRecord],
-) -> dict[str, dict[str, str]]:
-    """
-    从缓存中提取所有文档的 chunk_map。
-
-    返回: {document_title: {chunk_index: chunk_content}}
-
-    合并策略：
-    - crawl/fetch 的 chunk_map (全量) 优先
-    - local_search 的 chunks 作为补充
-    - 同一文档多次出现时取并集
-    """
-    result: dict[str, dict[str, str]] = defaultdict(dict)
-
-    # Pass 1: 收集 crawl/fetch 的完整 chunk_map（优先级高）
-    for record in cache:
-        if record.artifact is None:
-            continue
-        for doc in record.artifact.documents:
-            if doc.chunk_map:
-                # 完整 chunk_map 直接写入（覆盖 local_search 的部分数据）
-                result[doc.document_title].update(doc.chunk_map)
-
-    # Pass 2: 补充 local_search 的 chunks（不覆盖已有的）
-    for record in cache:
-        if record.artifact is None:
-            continue
-        for doc in record.artifact.documents:
-            if doc.chunk_map:
-                continue  # 已在 Pass 1 处理
-            for chunk in doc.chunks:
-                if chunk.chunk_index not in result[doc.document_title]:
-                    result[doc.document_title][chunk.chunk_index] = chunk.chunk_content
-
-    return dict(result)
-
-
-def extract_document_metadata_from_cache(
-    cache: list[ToolCallRecord],
-) -> dict[str, dict]:
-    """
-    从缓存中提取所有文档的元数据（去重）。
-
-    返回: {document_title: {"url": ..., "file_id": ..., "is_extracted": ...}}
-    """
-    metadata: dict[str, dict] = {}
-
-    for record in cache:
-        if record.artifact is None:
-            continue
-        for doc in record.artifact.documents:
-            title = doc.document_title
-            if title not in metadata:
-                metadata[title] = {
-                    "document_url": doc.document_url,
-                    "file_id": doc.file_id,
-                    "description": doc.description,
-                    "is_extracted": doc.is_extracted,
-                    "source_tools": [],
-                }
-            metadata[title]["source_tools"].append(record.tool_name)
-            # crawl/fetch 的 is_extracted 优先（它比 local_search 更明确）
-            if doc.is_extracted:
-                metadata[title]["is_extracted"] = True
-
-    return metadata
-

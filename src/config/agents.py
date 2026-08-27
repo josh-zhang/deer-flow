@@ -3,8 +3,10 @@
 
 from typing import Literal
 
+from google.api_core.retry import retry_unary
+
 # Define available LLM types
-LLMType = Literal["basic", "reasoning", "vision", "code"]
+LLMType = Literal["basic", "reasoning"]
 
 # Define agent-LLM mapping
 AGENT_LLM_MAP: dict[str, LLMType] = {
@@ -24,3 +26,8 @@ AGENT_LLM_MAP: dict[str, LLMType] = {
     "prose_writer": "basic",
     "prompt_enhancer": "basic",
 }
+
+def get_agent_llm_type(agent_name: str, enable_deep_thinking=True) -> LLMType:
+    llm_type = AGENT_LLM_MAP[agent_name]
+
+    return llm_type

@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import re
 import logging
-from typing import TypeVar
+import unicodedata
+from typing import TypeVar, Any
 
 from pydantic import BaseModel, ValidationError
 
-from planner_model import CPPlannerOutput, CPPointAnalystOutput
-from .curator_models import CuratorOutput, Relevance, normalize_doc_title
+from src.graph.curator_models import CuratorOutput, Relevance, EvidenceItem
+from src.rag.retriever import ToolCallRecord
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,40 @@ def parse_curator_output(text: str) -> CuratorOutput:
 
     return output
 
+def _enrich_evidence(evidence: EvidenceItem) -> None:
+    """从 body 文本解析结构化字段，就地更新。"""
+    for line in evidence.body.split("\n"):
+        stripped = line.strip()
+
+        if stripped.startswith("来源文档：") or stripped.startswith("来源文档:"):
+            evidence.source_document = _extract_after_colon(stripped)
+
+        elif stripped.startswith("段落编号：") or stripped.startswith("段落编号:") or stripped.startswith("引用段落：") or stripped.startswith("引用段落:"):
+            raw = _extract_after_colon(stripped)
+            # "1, 3, 7, 15" → ["1", "3", "7", "15"]
+            evidence.referenced_chunks = [
+                t.strip() for t in re.split(r"[,，\s]+", raw) if t.strip()
+            ]
+
+        elif stripped.startswith("信息质量：") or stripped.startswith("信息质量:"):
+            quality = _extract_after_colon(stripped)
+            if "已过期" in quality:
+                evidence.is_expired = True
+            if "工具截取" in quality:
+                evidence.is_tool_extracted = True
+
+        elif stripped.startswith("信息完整性：") or stripped.startswith("信息完整性:"):
+            completeness = _extract_after_colon(stripped)
+            if "工具截取" in completeness:
+                evidence.is_tool_extracted = True
+
+
+def _extract_after_colon(line: str) -> str:
+    for sep in ("：", ":"):
+        if sep in line:
+            return line.split(sep, 1)[1].strip()
+    return line.strip()
+
 
 def _load_json(text: str) -> dict:
     """尝试解析 JSON，失败时进行截断修复。"""
@@ -96,18 +131,21 @@ def _load_json(text: str) -> dict:
 
 
 def _count_discarded(discarded_text: str) -> int:
-    """从 discarded 自由文本中估算丢弃数量（尽力而为）。"""
     if "无丢弃" in discarded_text or not discarded_text.strip():
         return 0
-    # 计算表格数据行数（含 | 但不含 --- 的行，排除表头）
     lines = discarded_text.strip().split("\n")
-    data_rows = 0
-    for line in lines:
-        line = line.strip()
-        if "|" in line and "---" not in line and "序号" not in line:
-            data_rows += 1
-    return max(data_rows, 0)
+    return sum(
+        1 for line in lines
+        if "|" in line and "---" not in line and "序号" not in line
+    )
 
+
+def normalize_doc_title(title: str) -> str:
+    normalized = unicodedata.normalize("NFKC", title)
+
+    NONE_WORD_PATTERN = re.compile(r"[^\w]")
+
+    return NONE_WORD_PATTERN.sub("", normalized).strip()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -115,7 +153,7 @@ def _count_discarded(discarded_text: str) -> int:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def extract_citations_from_cache(
-    cache: list["ToolCallRecord"],
+    cache: list[ToolCallRecord],
 ) -> list[dict[str, Any]]:
     """
     从 Searcher 的 tool_returns_cache 中提取去重后的 citation 列表。
@@ -124,7 +162,6 @@ def extract_citations_from_cache(
     {
         "title":       str,   # 文档标题
         "url":         str,   # 文档 URL（可能为空）
-        "file_id":     str,   # 知识库文档编号（可能为空）
         "description": str,   # 文档分类描述
         "source_tool": str,   # 来源工具 "local_search_tool" | "crawl_tool" | "fetch_tool"
         "is_extracted": bool, # 是否经过截取
@@ -139,15 +176,17 @@ def extract_citations_from_cache(
 
         for doc in record.artifact.documents:
             # 去重 key: 优先用 url，其次用归一化 title
-            key = _citation_dedup_key(doc.document_title, doc.document_url)
+            normalize_title = normalize_doc_title(doc.document_title)
+
+            key = _citation_dedup_key(normalize_title, doc.document_url)
             if key in seen_keys:
                 continue
             seen_keys.add(key)
 
             citations.append({
-                "title": doc.document_title,
+                "title": normalize_title,
+                "original_title": doc.document_title,
                 "url": doc.document_url or "",
-                "file_id": doc.file_id or "",
                 "description": doc.description or "",
                 "source_tool": record.tool_name,
                 "is_extracted": doc.is_extracted,
@@ -284,20 +323,3 @@ def parse_model_from_text(text: str, model_class: type[T]) -> T:
         raise ValueError(
             f"模型校验失败: {e}。model={model_class.__name__}"
         )
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 类型化解析快捷函数
-# ══════════════════════════════════════════════════════════════════════
-
-def parse_planner_output(raw_text: str) -> CPPlannerOutput:
-    """解析 Planner 输出"""
-    return parse_model_from_text(raw_text, CPPlannerOutput)
-
-
-def parse_point_analyst_output(raw_text: str) -> CPPointAnalystOutput:
-    """解析 Point Analyst 输出"""
-    return parse_model_from_text(raw_text, CPPointAnalystOutput)
-
-
-

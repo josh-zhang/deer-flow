@@ -6,7 +6,8 @@ from typing import Annotated, Any
 
 from langgraph.graph import MessagesState
 
-from src.models.base import Plan, Resource
+from src.graph.planner_model import Plan
+from src.rag import Resource
 
 
 class State(MessagesState):
@@ -43,9 +44,7 @@ class State(MessagesState):
     enable_background_investigation: bool = True
     background_investigation_results: str | None = None  # 本体映射 XML 或降级时的原始检索 payload
     kb_panorama: str | None = None  # P1 修正：KB 轻量检索概要（独立于本体映射，供 Planner 长尾参考）
-    resources: Annotated[list[Resource], operator.add] = field(
-        default_factory=list
-    )
+    resources: list[Resource] = []
 
     # ═══════════════════════════════════════════════════
     #  Planner（结构化输出 — JSON）
@@ -56,8 +55,7 @@ class State(MessagesState):
     plan_iterations: int = 0
     max_plan_iterations: int = 3
     replan_iterations: int = 0
-    max_replan_iterations: int = 2  # CP 默认 2，BI 默认 3
-    last_plan_text: str = ""
+    last_plan: str = ""
 
     # ═══════════════════════════════════════════════════
     #  Plan Validation
@@ -65,23 +63,22 @@ class State(MessagesState):
     planner_override_occurred: bool = False
     structure_validation_retried: bool = False
     _plan_validator_needs_rerun: bool = False
-    skip_next_plan_iteration_increment: bool = False
 
     # ═══════════════════════════════════════════════════
     #  Searcher Output — Markdown 文本，跨步骤累积
     # ═══════════════════════════════════════════════════
-    searcher_results: list[str] = field(default_factory=list)
-    searcher_summaries: list[str] = field(default_factory=list)
+    observations: list[str] = []
+    searcher_results: list[tuple[str, str]] = []
 
     # ═══════════════════════════════════════════════════
     #  Curator Output — Markdown 文本
     # ═══════════════════════════════════════════════════
-    curator_rule_splitter_views: list[str] = field(default_factory=list)
+    curator_rule_splitter_views: list[str] = []
 
     # ═══════════════════════════════════════════════════
     #  Rule Splitter Output — Markdown 文本
     # ═══════════════════════════════════════════════════
-    atomic_rules: list[str] = field(default_factory=list)
+    atomic_rules: list[str] = []
 
     # ═══════════════════════════════════════════════════
     #  Arbitrator Output — Markdown 文本
@@ -94,7 +91,6 @@ class State(MessagesState):
     analyst_output: dict[str, Any] = field(default_factory=dict)
     replanning_needed: bool = False
     replanning_reason: str = ""
-    observations: list[str] = field(default_factory=list)
 
     # ═══════════════════════════════════════════════════
     #  Reporter Output — Markdown 文本
@@ -104,7 +100,7 @@ class State(MessagesState):
     # ═══════════════════════════════════════════════════
     #  Citations — 全局累积
     # ═══════════════════════════════════════════════════
-    citations: Annotated[list[dict[str, Any]], operator.add] = field(
+    citations: list[dict[str, Any]] = field(
         default_factory=list
     )
 
@@ -113,12 +109,6 @@ class State(MessagesState):
     # ═══════════════════════════════════════════════════
     auto_accepted_plan: bool = False
     goto: str = "planner"
-
-    # ═══════════════════════════════════════════════════
-    #  CP 扩展字段
-    # ═══════════════════════════════════════════════════
-    promotional_text: str = ""       # 宣传文本原文（CP 输入）
-    analyzer_output: str = ""        # Analyzer 输出（审查范围分析报告 Markdown）
 
     # ═══════════════════════════════════════════════════
     #  Document Chunk Maps — 全局累积，跨步骤合并
@@ -142,6 +132,6 @@ class State(MessagesState):
     #    {id, message_id, name, mime, kind ("text"|"image"),
     #     size_bytes, text (when kind=="text"), b64 (when kind=="image")}
     # ═══════════════════════════════════════════════════
-    attached_files: Annotated[list[dict[str, Any]], operator.add] = field(
+    attached_files: list[dict[str, Any]] = field(
         default_factory=list
     )
