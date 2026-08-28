@@ -251,7 +251,12 @@ def generate_searcher_summary(
         f"- **已覆盖标的**：{', '.join(covered) if covered else '无'}",
         f"- **未覆盖标的**：{', '.join(uncovered) if uncovered else '无'}",
         f"- **已发现文档**：",
-        *doc_list if doc_list else ["  - 无"],
+    ]
+    if doc_list:
+        lines.extend(doc_list)
+    else:
+        lines.append("  - 无")
+    lines += [
         f"- **待追踪线索**：{', '.join(leads) if leads else '无'}",
     ]
 

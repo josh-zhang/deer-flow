@@ -702,6 +702,24 @@ def plan_validator_node(state: State) -> dict:
         logger.error("plan_validator: current_plan is None")
         return {"_plan_validator_needs_rerun": False}
 
+    # planner 存入的是原始文本（full_response），此处统一解析为 Plan 对象供全下游使用
+    if isinstance(plan, str):
+        try:
+            plan_data = json.loads(repair_json_output(plan))
+            plan_content = extract_plan_content(plan_data)
+            new_plan = json.loads(repair_json_output(plan_content))
+            plan = Plan.model_validate(new_plan)
+            for s in plan.steps:
+                s.execution_res = None
+            logger.info(f"plan_validator: parsed plan text -> Plan ({len(plan.steps)} steps, wf={plan.workflow_type})")
+        except Exception as e:
+            logger.error(f"plan_validator: failed to parse plan text to Plan: {e}")
+            return {
+                "_plan_validator_needs_rerun": False,
+                "last_plan": plan,
+                **preserve_state_meta_fields(state),
+            }
+
     current_wf = state["workflow_type"]
     override_occurred = state.get("planner_override_occurred", False)
     validation_retried = state.get("structure_validation_retried", False)
@@ -719,6 +737,7 @@ def plan_validator_node(state: State) -> dict:
         state["workflow_confidence"] = "high"  # Planner 自行判断，视为高置信
         # Build update dict with safe locale handling
         return {
+            "current_plan": plan,
             "planner_override_occurred": True,
             "_plan_validator_needs_rerun": True,
             "last_plan": plan_str,
@@ -734,6 +753,7 @@ def plan_validator_node(state: State) -> dict:
         )
         state["workflow_type"] = "A"
         return {
+            "current_plan": plan,
             "structure_validation_retried": True,
             "_plan_validator_needs_rerun": True,
             "last_plan": plan_str,
@@ -749,6 +769,7 @@ def plan_validator_node(state: State) -> dict:
     # -- All Checks Passed --
     logger.info("Plan Validator: All checks passed.")
     return {
+        "current_plan": plan,
         "_plan_validator_needs_rerun": False,
         "last_plan": plan_str,
         **preserve_state_meta_fields(state),
@@ -1331,10 +1352,14 @@ async def _execute_agent_step(
 
     # Format completed steps information
     if is_curator:
-        searcher_annotations, raw_tool_returns = search_results[-1]
+        searcher_annotations, raw_tool_returns = search_results[-1] if search_results else ("", "")
         completed_steps_info = (
             f"# 检索结果摘要\n\n{searcher_annotations}\n\n# 原始工具返回\n\n{raw_tool_returns}\n\n"
         )
+        if not search_results:
+            logger.warning(
+                "[_execute_agent_step] curator: search_results is empty (researcher produced no annotation); continuing with empty evidence view"
+            )
     elif is_searcher:
         if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
             step_index = 1
@@ -1654,7 +1679,7 @@ async def _execute_agent_step(
                 curator_output = parse_curator_output(response_content)
                 resolved = resolve_all_evidence_chunks(
                     curator_output=curator_output,
-                    document_chunk_maps=state["document_chunk_maps"],
+                    document_chunk_maps=state.get("document_chunk_maps", {}),
                 )
                 # 使用 resolved_chunks 替换 body 中的具体内容（原文段落，未经精简）
                 curator_rule_splitter_view = build_rule_splitter_view_with_resolved(
@@ -1704,7 +1729,7 @@ async def _execute_agent_step(
                     curator_output = parse_curator_output(response_content)
                     resolved = resolve_all_evidence_chunks(
                         curator_output=curator_output,
-                        document_chunk_maps=state["document_chunk_maps"],
+                        document_chunk_maps=state.get("document_chunk_maps", {}),
                     )
                     # 使用 resolved_chunks 替换 body 中的具体内容（原文段落，未经精简）
                     curator_rule_splitter_view = build_rule_splitter_view_with_resolved(

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import logging
-from typing import List, Optional, Type
+from typing import List, Literal, Optional, Type
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForToolRun,
@@ -13,52 +13,67 @@ from pydantic import BaseModel, Field
 
 from src.config.tools import SELECTED_RAG_PROVIDER
 from src.rag import Document, Resource, Retriever, build_retriever
+from src.rag.retriever import format_local_search_return
 
 logger = logging.getLogger(__name__)
 
 
 class RetrieverInput(BaseModel):
-    keywords: str = Field(description="search keywords to look up")
+    query: str = Field(description="search keywords to look up")
+    background: str = Field(
+        default="",
+        description="background context of the current search step",
+    )
 
 
 class RetrieverTool(BaseTool):
     name: str = "local_search_tool"
     description: str = "Useful for retrieving information from the file with `rag://` uri prefix, it should be higher priority than the web search or writing code. Input should be a search keywords."
     args_schema: Type[BaseModel] = RetrieverInput
+    response_format: Literal["content", "content_and_artifact"] = "content_and_artifact"
 
     retriever: Retriever = Field(default_factory=Retriever)
     resources: list[Resource] = Field(default_factory=list)
+    top_k: int = 10
 
     def _run(
         self,
-        keywords: str,
+        query: str,
+        background: str = "",
         run_manager: Optional[CallbackManagerForToolRun] = None,
-    ) -> list[Document]:
+    ) -> tuple[str, dict]:
         logger.info(
-            f"Retriever tool query: {keywords}", extra={"resources": self.resources}
+            f"Retriever tool query: {query}", extra={"resources": self.resources}
         )
-        documents = self.retriever.query_relevant_documents(keywords, self.resources)
+        documents = self.retriever.query_relevant_documents(
+            query, self.top_k, background, self.resources
+        )
         if not documents:
-            return "No results found from the local knowledge base."
-        return [doc.to_dict() for doc in documents]
+            return "No results found from the local knowledge base.", None
+        return format_local_search_return(documents)
 
     async def _arun(
         self,
-        keywords: str,
+        query: str,
+        background: str = "",
         run_manager: Optional[AsyncCallbackManagerForToolRun] = None,
-    ) -> list[Document]:
+    ) -> tuple[str, dict]:
         logger.info(
-            f"Retriever tool query: {keywords}", extra={"resources": self.resources}
+            f"Retriever tool query: {query}", extra={"resources": self.resources}
         )
         documents = await self.retriever.query_relevant_documents_async(
-            keywords, self.resources
+            query, self.top_k, background, self.resources
         )
         if not documents:
-            return "No results found from the local knowledge base."
-        return [doc.to_dict() for doc in documents]
+            return "No results found from the local knowledge base.", None
+        return format_local_search_return(documents)
 
 
-def get_retriever_tool(resources: List[Resource]) -> RetrieverTool | None:
+def get_retriever_tool(
+    max_search_results: int,
+    report_style: str,
+    resources: List[Resource],
+) -> RetrieverTool | None:
     if not resources:
         return None
     logger.info(f"create retriever tool: {SELECTED_RAG_PROVIDER}")
@@ -66,4 +81,6 @@ def get_retriever_tool(resources: List[Resource]) -> RetrieverTool | None:
 
     if not retriever:
         return None
-    return RetrieverTool(retriever=retriever, resources=resources)
+    return RetrieverTool(
+        retriever=retriever, resources=resources, top_k=max_search_results
+    )

@@ -1,8 +1,10 @@
 # Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: MIT
 
+import asyncio
 import hashlib
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
@@ -26,6 +28,16 @@ from src.rag.retriever import Chunk, Document, Resource, Retriever
 logger = logging.getLogger(__name__)
 
 SCROLL_SIZE = 64
+
+
+def _iter_md_files(root: Path) -> list[Path]:
+    """递归遍历 md 文件（followlinks=True，支持 symlink 目录）。"""
+    files: list[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=True):
+        for f in filenames:
+            if f.endswith(".md"):
+                files.append(Path(dirpath) / f)
+    return files
 
 
 class DashscopeEmbeddings:
@@ -87,7 +99,8 @@ class QdrantProvider(Retriever):
             "model": self.embedding_model_name,
             "base_url": self.embedding_base_url,
             "encoding_format": "float",
-            "dimensions": self.embedding_dim,
+            # Ollama 兼容端点不支持 token id 输入，禁用 langchain 的 token 化预检
+            "check_embedding_ctx_length": False,
         }
         if self.embedding_provider.lower() == "openai":
             self.embedding_model = OpenAIEmbeddings(**kwargs)
@@ -131,7 +144,7 @@ class QdrantProvider(Retriever):
 
         logger.info("Loading example files from: %s", examples_path)
 
-        md_files = list(examples_path.glob("*.md"))
+        md_files = _iter_md_files(examples_path)
         if not md_files:
             logger.info("No markdown files found in examples directory")
             return
@@ -289,6 +302,14 @@ class QdrantProvider(Retriever):
         return self.embedding_model.embed_query(text=text.strip())
 
     def list_resources(self, query: Optional[str] = None) -> List[Resource]:
+        # 本地 md 目录优先（测试环境：test_kb 目录即权威资源清单）
+        try:
+            local = self._list_local_markdown_resources()
+            if local:
+                return local
+        except Exception:
+            pass
+
         resources: List[Resource] = []
 
         if not self.client:
@@ -358,27 +379,54 @@ class QdrantProvider(Retriever):
         if not examples_path.exists():
             return []
 
-        md_files = list(examples_path.glob("*.md"))
+        md_files = _iter_md_files(examples_path)
         resources: list[Resource] = []
         for md_file in md_files:
             try:
                 content = md_file.read_text(encoding="utf-8", errors="ignore")
                 title = self._extract_title_from_markdown(content, md_file.name)
                 uri = f"qdrant://{self.collection_name}/{md_file.name}"
+                # 用相对 test_kb 的父目录作为知识库类型描述（如 concepts/entities）
+                rel = md_file.relative_to(examples_path)
+                category = str(rel.parent).replace("\\", "/")
                 resources.append(
                     Resource(
                         uri=uri,
                         title=title,
-                        description="Local markdown example (not yet ingested)",
+                        description=category if category != "." else "wiki",
                     )
                 )
             except Exception:
                 continue
         return resources
 
+    def _local_desc_map(self) -> Dict[str, str]:
+        """title -> description(知识库类型) 缓存映射。"""
+        if getattr(self, "_desc_map_cache", None) is None:
+            cache: Dict[str, str] = {}
+            try:
+                for r in self._list_local_markdown_resources():
+                    cache[r.title] = r.description or ""
+            except Exception:
+                pass
+            self._desc_map_cache = cache
+        return self._desc_map_cache
+
     def query_relevant_documents(
-        self, query: str, resources: Optional[List[Resource]] = None
-    ) -> List[Document]:
+        self,
+        query: str,
+        top_k: int = 10,
+        background: str = "",
+        resources: list[Resource] = [],
+    ) -> dict[str, dict]:
+        """Query relevant documents and return doc_groups (title -> doc dict).
+
+        Return contract aligned with DifyProvider: doc_groups[doc_title] = {
+            "document_title", "document_url", "description", "chunks": [
+                {"chunk_index", "chunk_content"}, ...
+            ]
+        }
+        """
         resources = resources or []
         if not self.client:
             self._connect()
@@ -388,15 +436,15 @@ class QdrantProvider(Retriever):
         search_results = self.client.query_points(
             collection_name=self.collection_name,
             query=query_embedding,
-            limit=self.top_k,
+            limit=top_k,
             with_payload=True,
         ).points
 
-        documents = {}
+        doc_groups: dict[str, dict] = {}
 
         for result in search_results:
             payload = result.payload or {}
-            doc_id = payload.get("doc_id", str(result.id))
+            chunk_doc_id = payload.get("doc_id", str(result.id))
             content = payload.get("content", "")
             title = payload.get("title", "")
             url = payload.get("url", "")
@@ -405,19 +453,57 @@ class QdrantProvider(Retriever):
             if resources:
                 doc_in_resources = False
                 for resource in resources:
-                    if (url and url in resource.uri) or doc_id in resource.uri:
+                    if (url and url in resource.uri) or chunk_doc_id in resource.uri:
                         doc_in_resources = True
                         break
                 if not doc_in_resources:
                     continue
 
-            if doc_id not in documents:
-                documents[doc_id] = Document(id=doc_id, url=url, title=title, chunks=[])
+            if title not in doc_groups:
+                # 资源优先，否则从本地 md 描述映射兜底
+                description = ""
+                for resource in resources:
+                    if resource.uri and (url in resource.uri or chunk_doc_id in resource.uri):
+                        description = resource.description or ""
+                        break
+                if not description:
+                    description = self._local_desc_map().get(title, "")
+                doc_groups[title] = {
+                    "document_title": title,
+                    "document_url": url,
+                    "description": description,
+                    "chunks": [],
+                }
 
-            chunk = Chunk(content=content, similarity=score)
-            documents[doc_id].chunks.append(chunk)
+            chunk_index = (
+                chunk_doc_id.split("_chunk_")[-1] if "_chunk_" in chunk_doc_id else "0"
+            )
+            doc_groups[title]["chunks"].append(
+                {
+                    "chunk_index": chunk_index,
+                    "chunk_content": content,
+                }
+            )
 
-        return list(documents.values())
+        return doc_groups
+
+    async def query_relevant_documents_async(
+        self,
+        query: str,
+        top_k: int = 10,
+        background: str = "",
+        resources: list[Resource] = [],
+    ) -> dict[str, dict]:
+        """Async wrapper: delegate to sync implementation."""
+        return await asyncio.to_thread(
+            self.query_relevant_documents, query, top_k, background, resources
+        )
+
+    async def list_resources_async(
+        self, query: str | None = None
+    ) -> list[Resource]:
+        """Async wrapper: delegate to sync implementation."""
+        return await asyncio.to_thread(self.list_resources, query)
 
     def create_collection(self) -> None:
         if not self.client:

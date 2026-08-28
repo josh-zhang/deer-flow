@@ -7,8 +7,8 @@ import requests
 from langchain_core.tools import tool
 
 from src.rag.retriever import Chunk, Document
-from src.tools.extractor import (
-    extract_relevant_chunks,
+from src.tools.extractor import extract_relevant_chunks
+from src.rag.retriever import (
     format_crawl_fetch_return,
     generate_checksum,
     remove_line_start_hashes,

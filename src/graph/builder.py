@@ -35,6 +35,10 @@ def route_from_planner(state: State) -> Literal["planner", "researcher", "arbitr
     if not current_plan:
         logger.warning("current_plan is None")
         return "planner"
+    # 防御: planner 存的是原始文本时（validator 解析失败未回写），回 planner 重新生成
+    if isinstance(current_plan, str):
+        logger.warning("route_from_planner: current_plan is still a string, goto planner")
+        return "planner"
     if getattr(current_plan, "steps") is None or not current_plan.steps:
         return "planner"
 
@@ -79,8 +83,8 @@ def route_from_splitter(state: State):
 
     logger.debug(f"route from splitter {current_plan}")
 
-    if not current_plan or not isinstance(current_plan, str):
-        logger.error(f"route from splitter current_plan is None")
+    if not current_plan or not getattr(current_plan, "steps", None):
+        logger.error("route from splitter: current_plan is missing steps")
         return "reporter"
 
     # Find first incomplete step execution_res
@@ -147,7 +151,6 @@ def build_base_graph() -> StateGraph:
     # — Fixed Edges —
     builder.add_edge(START, "coordinator")
     builder.add_edge("background_investigator", "planner")
-    builder.add_edge("human_feedback", "plan_validator")
     builder.add_edge("researcher", "curator")
     builder.add_edge("curator", "rule_splitter")
     builder.add_edge("arbitrator", "analyst")  # BI 路径专属

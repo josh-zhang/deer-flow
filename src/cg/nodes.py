@@ -41,12 +41,12 @@ from src.cg.utils import (
 #     check_consistency 在 _adapt_one_channel 后调用。
 from src.config.agents import AGENT_LLM_MAP
 from src.config.configuration import Configuration
-from src.graph.nodes import (
-    ToolCallRecord,
+from src.graph.curator_views import (
     extract_chunk_maps_from_cache,
     extract_document_metadata_from_cache,
-    make_tool_saver_hook,
 )
+from src.agents.agents import make_tool_saver_hook
+from src.rag.retriever import ToolCallRecord
 from src.graph.ontology import render_cg_audit_edge_checklist
 from src.llms.llm import get_llm_by_type, get_llm_token_limit_by_type
 from src.prompts.template import apply_prompt_template, get_system_prompt_template

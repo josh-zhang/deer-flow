@@ -14,6 +14,11 @@ class State(MessagesState):
     """BI / CP 通用 Investigation Pipeline State"""
 
     # ═══════════════════════════════════════════════════
+    #  Locale / Pipeline 模式标识
+    # ═══════════════════════════════════════════════════
+    locale: str = "zh-CN"
+
+    # ═══════════════════════════════════════════════════
     #  Pipeline 模式标识
     # ═══════════════════════════════════════════════════
     pipeline_mode: str = "bi"  # "bi" | "cp"
@@ -50,7 +55,7 @@ class State(MessagesState):
     #  Planner（结构化输出 — JSON）
     # ═══════════════════════════════════════════════════
     current_plan: Plan | None = None
-    current_plan_last_round: Plan | None = None
+    current_plan_cached: Plan | None = None
     missing_conditions: list[str] = field(default_factory=list)
     plan_iterations: int = 0
     max_plan_iterations: int = 3
@@ -68,7 +73,7 @@ class State(MessagesState):
     #  Searcher Output — Markdown 文本，跨步骤累积
     # ═══════════════════════════════════════════════════
     observations: list[str] = []
-    searcher_results: list[tuple[str, str]] = []
+    search_results: list[tuple[str, str]] = []
 
     # ═══════════════════════════════════════════════════
     #  Curator Output — Markdown 文本
@@ -89,8 +94,8 @@ class State(MessagesState):
     #  Analyst Output（结构化输出 — JSON）
     # ═══════════════════════════════════════════════════
     analyst_output: dict[str, Any] = field(default_factory=dict)
-    replanning_needed: bool = False
-    replanning_reason: str = ""
+    replan: bool = False
+    replan_reason: str = ""
 
     # ═══════════════════════════════════════════════════
     #  Reporter Output — Markdown 文本

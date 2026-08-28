@@ -64,13 +64,15 @@ def get_prompt_template(report_style: str, prompt_name: str) -> str:
 
 
 def apply_prompt_template(
-    report_style: str, prompt_name: str, state: AgentState, configurable: Configuration = None
+    prompt_name: str, state: AgentState, configurable: Configuration = None
 ) -> list:
     """
     Apply template variables to a prompt template and return formatted messages.
 
+    调用约定（全库 19 处调用点一致）：apply_prompt_template(prompt_name, state, configurable)
+    report_style 由 configurable.report_style 决定（BI/CP/CG 三套环境模板）。
+
     Args:
-        report_style: bi | cp | cg
         prompt_name: Name of the prompt template to use
         state: Current agent state containing variables to substitute
         configurable: Configuration object with additional variables
@@ -79,13 +81,13 @@ def apply_prompt_template(
         List of messages with the system prompt as the first message
     """
     try:
-        system_prompt = get_system_prompt_template(report_style, prompt_name, state, configurable)
+        system_prompt = get_system_prompt_template(prompt_name, state, configurable)
         return [{"role": "system", "content": system_prompt}] + state["messages"]
     except Exception as e:
-        raise ValueError(f"Error applying template {prompt_name}")
+        raise ValueError(f"Error applying template {prompt_name}: {e}")
 
 def get_system_prompt_template(
-    report_style: str, prompt_name: str, state: AgentState, configurable: Configuration = None
+    prompt_name: str, state: AgentState, configurable: Configuration = None
 ) -> str:
     """
     Render and return the system prompt template with state and configuration variables.
@@ -93,13 +95,24 @@ def get_system_prompt_template(
     variants), applies variables from the agent state and Configuration object, and
     returns the fully rendered system prompt string.
     Args:
-        report_style: bi | cp | cg
         prompt_name: Name of the prompt template to load (without .md extension).
         state: Current agent state containing variables available to the template.
         configurable: Optional Configuration object providing additional template variables.
     Returns:
         The rendered system prompt string after applying all template variables.
     """
+    # report_style 从 configurable 推导（3 参调用约定）
+    if configurable:
+        report_style = configurable.report_style
+    else:
+        report_style = ReportStyle.BANK_BUSINESS_ANALYSIS.value
+
+    # agent 名 → 模板文件名别名（历史命名差异：节点叫 researcher，BI 模板叫 searcher）
+    template_alias = {
+        "researcher": "searcher",
+    }
+    lookup_name = template_alias.get(prompt_name, prompt_name)
+
     # Convert state to dict for template rendering
     if report_style == ReportStyle.BANK_BUSINESS_ANALYSIS.value:
         this_env = bi_env
@@ -121,10 +134,10 @@ def get_system_prompt_template(
 
         # Try locale-specific template first
         try:
-            template = this_env.get_template(f"{prompt_name}.zh_CN.md")
+            template = this_env.get_template(f"{lookup_name}.zh_CN.md")
         except TemplateNotFound:
             # Fallback to English template
-            template = this_env.get_template(f"{prompt_name}.md")
+            template = this_env.get_template(f"{lookup_name}.md")
 
         system_prompt = template.render(**state_vars)
         return f"{system_prompt}\n\n输出数学公式时必须使用 Unicode 字符，例如 '→'。"
