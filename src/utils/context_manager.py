@@ -22,11 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 # 匹配 chunk header: **[任意编号]** 可能跟 `[上下文]` / `[兜底]`
-_CHUNK_HEADER_RE = re.compile(r"^\*\*\[.+?\]\*\*")
+_CHUNK_HEADER_RE = re.compile(r"^\*\*段落\[.+?\]\*\*")
 
 # 识别 Markdown 结构行（不截断）
 _STRUCTURAL_PREFIXES = (
-    "**文档", "**[",             # 文档标题 / 段落编号
+    "**文档", "**段落[",             # 文档标题 / 段落编号
     "===", "---",                # 分隔符
     "【截取结果】",               # 截取水印
     "#",                         # Markdown 标题

@@ -65,7 +65,7 @@ class ToolInterceptor:
         try:
             # Handle dictionaries and other JSON-serializable objects
             if isinstance(tool_input, (dict, list, tuple)):
-                return json.dumps(tool_input, indent=2, default=str)
+                return json.dumps(tool_input, indent=2, default=str, ensure_ascii=False)
             elif isinstance(tool_input, str):
                 return tool_input
             else:

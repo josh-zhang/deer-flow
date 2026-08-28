@@ -4,6 +4,7 @@ import re
 import requests
 from urllib.parse import urlencode
 from typing import Annotated, Dict, Tuple
+from langchain_core.tools import tool
 
 from src.rag.retriever import Chunk, Document, format_crawl_fetch_return, generate_checksum, remove_line_start_hashes
 from src.tools.extractor import extract_relevant_chunks
@@ -31,8 +32,9 @@ def is_valid_file_id(s: str) -> bool:
     return bool(re.fullmatch(pattern, s))
 
 
-@log_io()
-def fetch_file_content_by_name(
+@tool(response_format="content_and_artifact")
+@log_io
+def fetch_tool(
     file_name: Annotated[
         str, "The file name to fetch, do not include suffix."
     ],

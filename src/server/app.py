@@ -12,6 +12,8 @@ from uuid import uuid4
 # Load environment variables from .env file FIRST
 # This must happen before checking DEBUG environment variable
 from dotenv import load_dotenv
+from langfuse.langchain import CallbackHandler
+
 load_dotenv()
 
 # Configure logging based on DEBUG environment variable
@@ -71,6 +73,8 @@ from src.utils.log_sanitizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+langfuse_handler = CallbackHandler()
 
 # Configure Windows event loop policy for PostgreSQL compatibility
 # On Windows, psycopg requires a selector-based event loop, not the default ProactorEventLoop
@@ -226,12 +230,12 @@ app.add_middleware(
     allow_headers=["*"],  # Now allow all headers, but can be restricted further
 )
 # Load examples into RAG providers if configured
-load_milvus_examples()
-load_qdrant_examples()
+# load_milvus_examples()
+# load_qdrant_examples()
 
 in_memory_store = InMemoryStore()
 graph = build_graph_with_memory()
-cg_graph = build_cg_graph_with_memory()
+# cg_graph = build_cg_graph_with_memory()
 
 
 @app.post("/api/chat/stream")
@@ -474,7 +478,7 @@ async def _process_message_chunk(message_chunk, message_metadata, thread_id, age
     agent_name = _get_agent_name(agent, message_metadata)
     safe_agent_name = sanitize_agent_name(agent_name)
     safe_thread_id = sanitize_thread_id(thread_id)
-    safe_agent = sanitize_agent_name(agent)
+    # safe_agent = sanitize_agent_name(agent)
     logger.debug(f"[{safe_thread_id}] _process_message_chunk started for agent={safe_agent_name}")
     logger.debug(f"[{safe_thread_id}] Extracted agent_name: {safe_agent_name}")
     
@@ -784,8 +788,18 @@ async def _astream_workflow_generator(
     )
     latest_message_content = messages[-1]["content"] if messages else ""
     clarified_research_topic = clarified_topic or latest_message_content
-    safe_topic = sanitize_user_content(clarified_research_topic)
-    logger.debug(f"[{safe_thread_id}] Clarified research topic: {safe_topic}")
+    # safe_topic = sanitize_user_content(clarified_research_topic)
+    # logger.debug(f"[{safe_thread_id}] Clarified research topic: {safe_topic}")
+
+    if attached_files:
+        logger.debug(
+            f"[{safe_thread_id}] Received {len(attached_files)} attached file(s) "
+            f"this turn: {[(a['name'], a['kind']) for a in attached_files]}"
+        )
+
+        attachments_block = format_attached_files_for_prompt(attached_files)
+        if attachments_block:
+            latest_message_content += f"\n## 用户附件\n\n{attachments_block}\n"
 
     # Prepare workflow input
     logger.debug(f"[{safe_thread_id}] Preparing workflow input")
@@ -798,6 +812,7 @@ async def _astream_workflow_generator(
         "auto_accepted_plan": auto_accepted_plan,
         "enable_background_investigation": enable_background_investigation,
         "research_topic": latest_message_content,
+        "original_topic": latest_message_content,
         "clarification_history": clarification_history,
         "clarified_research_topic": clarified_research_topic,
         "enable_clarification": enable_clarification,
@@ -807,15 +822,6 @@ async def _astream_workflow_generator(
         # so checkpointer-resumed prior-turn attachments are preserved.
         "attached_files": attached_files or [],
     }
-    if attached_files:
-        logger.debug(
-            f"[{safe_thread_id}] Received {len(attached_files)} attached file(s) "
-            f"this turn: {[(a['name'], a['kind']) for a in attached_files]}"
-        )
-
-        attachments_block = format_attached_files_for_prompt(attached_files)
-        if attachments_block:
-            latest_message_content += f"\n## 用户附件\n\n{attachments_block}\n"
 
     if not auto_accepted_plan and interrupt_feedback:
         logger.debug(f"[{safe_thread_id}] Creating resume command with interrupt_feedback: {safe_feedback}")
@@ -838,12 +844,11 @@ async def _astream_workflow_generator(
         "max_plan_iterations": max_plan_iterations,
         "max_step_num": max_step_num,
         "max_search_results": max_search_results,
-        "mcp_settings": mcp_settings,
-        "enable_web_search": enable_web_search,
         "report_style": report_style.value,
         "enable_deep_thinking": enable_deep_thinking,
         "interrupt_before_tools": interrupt_before_tools,
         "recursion_limit": get_recursion_limit(),
+        "callbacks": [langfuse_handler],
     }
 
     checkpoint_saver = get_bool_env("LANGGRAPH_CHECKPOINT_SAVER", False)
@@ -929,7 +934,7 @@ async def _astream_workflow_generator(
         logger.debug(f"[{safe_thread_id}] Graph event streaming completed")
 
 
-def _make_event(event_type: str, data: dict[str, any]):
+def _make_event(event_type: str, data: dict):
     if data.get("content") == "":
         data.pop("content")
     # Ensure JSON serialization with proper encoding
@@ -949,108 +954,6 @@ def _make_event(event_type: str, data: dict[str, any]):
         # Return a safe error event
         error_data = json.dumps({"error": "Serialization failed"}, ensure_ascii=False)
         return f"event: error\ndata: {error_data}\n\n"
-
-
-async def _astream_cg_generator(request: CGRequest, thread_id: str):
-    """CG 合规营销文案生成流水线 SSE 流式输出。"""
-    safe_thread_id = sanitize_thread_id(thread_id)
-    logger.info(
-        f"[{safe_thread_id}] CG stream starting: "
-        f"product={request.product_name}, type={request.product_type}, "
-        f"channels={request.channels}, personas={request.personas}"
-    )
-
-    cg_input = {
-        "product_name": request.product_name,
-        "product_type": request.product_type,
-        "campaign_name": request.campaign_name,
-        "channels": request.channels,
-        "personas": request.personas,
-        "scene_empathy": request.scene_empathy,
-        "relationship_temperature": request.relationship_temperature,
-        "privacy_boundary": request.privacy_boundary,
-    }
-
-    workflow_input = {
-        "cg_input": cg_input,
-        "locale": request.locale,
-        "messages": [],
-    }
-
-    workflow_config = {
-        "thread_id": thread_id,
-        "resources": request.resources or [],
-        "recursion_limit": get_recursion_limit(),
-    }
-
-    checkpoint_saver = get_bool_env("LANGGRAPH_CHECKPOINT_SAVER", False)
-    checkpoint_url = get_str_env("LANGGRAPH_CHECKPOINT_DB_URL", "")
-
-    logger.debug(
-        f"[{safe_thread_id}] Checkpoint configuration: "
-        f"saver_enabled={checkpoint_saver}, "
-        f"url_configured={bool(checkpoint_url)}"
-    )
-
-    if checkpoint_saver and checkpoint_url != "":
-        if checkpoint_url.startswith("postgresql://") and _pg_checkpointer:
-            cg_graph.checkpointer = _pg_checkpointer
-            cg_graph.store = in_memory_store
-        elif checkpoint_url.startswith("postgresql://"):
-            connection_kwargs = {
-                "autocommit": True,
-                "row_factory": "dict_row",
-                "prepare_threshold": 0,
-            }
-            async with AsyncConnectionPool(
-                checkpoint_url, kwargs=connection_kwargs
-            ) as conn:
-                checkpointer = AsyncPostgresSaver(conn)
-                await checkpointer.setup()
-                cg_graph.checkpointer = checkpointer
-                cg_graph.store = in_memory_store
-                async for event in _stream_graph_events(
-                    cg_graph, workflow_input, workflow_config, thread_id
-                ):
-                    yield event
-                return
-        elif checkpoint_url.startswith("mongodb://") and _mongo_checkpointer:
-            cg_graph.checkpointer = _mongo_checkpointer
-            cg_graph.store = in_memory_store
-        elif checkpoint_url.startswith("mongodb://"):
-            async with AsyncMongoDBSaver.from_conn_string(
-                checkpoint_url
-            ) as checkpointer:
-                cg_graph.checkpointer = checkpointer
-                cg_graph.store = in_memory_store
-                async for event in _stream_graph_events(
-                    cg_graph, workflow_input, workflow_config, thread_id
-                ):
-                    yield event
-                return
-
-    async for event in _stream_graph_events(
-        cg_graph, workflow_input, workflow_config, thread_id
-    ):
-        yield event
-
-    logger.debug(f"[{safe_thread_id}] Graph event streaming completed")
-
-
-@app.post("/api/cg/stream")
-async def cg_stream(request: CGRequest):
-    """CG 合规营销文案生成流式端点。
-
-    流水线: fact_miner ‖ rule_miner → copy_strategist → copy_writer → adapt_audit_assemble
-    """
-    thread_id = request.thread_id
-    if thread_id == "__default__":
-        thread_id = str(uuid4())
-
-    return StreamingResponse(
-        _astream_cg_generator(request, thread_id),
-        media_type="text/event-stream",
-    )
 
 
 @app.get("/api/rag/config", response_model=RAGConfigResponse)

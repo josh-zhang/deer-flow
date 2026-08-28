@@ -109,42 +109,42 @@ class SyncLLMTagger:
                 for d in batch_docs
             ]
 
-    def get_reranked_chunks(
-        self,
-        query: str,
-        documents: list[str],
-        background: str,
-        batch_size: int = 20,
-        need_sorting: bool = True,
-    ) -> list[Dict[str, Any]]:
-        """主入口: 串行批量排序，顺序是每批次 (Sequential Processing)"""
-        if not documents:
-            return []
+def get_reranked_chunks(
+    self,
+    query: str,
+    documents: list[str],
+    background: str,
+    batch_size: int = 20,
+    need_sorting: bool = True,
+) -> list[Dict[str, Any]]:
+    """主入口: 串行批量排序，顺序是每批次 (Sequential Processing)"""
+    if not documents:
+        return []
 
-        tagger = SyncLLMTagger()
+    tagger = SyncLLMTagger()
 
-        # 1. 预处理
+    # 1. 预处理
 
-        indexed_docs = [
-            {"original_index": i, "content": doc} for i, doc in enumerate(documents)
-        ]
+    indexed_docs = [
+        {"original_index": i, "content": doc} for i, doc in enumerate(documents)
+    ]
 
-        # 2. 切批次
-        chunks = [
-            indexed_docs[i: i + batch_size]
-            for i in range(0, len(indexed_docs), batch_size)
-        ]
+    # 2. 切批次
+    chunks = [
+        indexed_docs[i: i + batch_size]
+        for i in range(0, len(indexed_docs), batch_size)
+    ]
 
-        # 3. 顺序处理
-        all_results = []
-        for chunk in chunks:
-            batch_result = tagger.process_batch(chunk, query, background)
-            all_results.extend(batch_result)
+    # 3. 顺序处理
+    all_results = []
+    for chunk in chunks:
+        batch_result = tagger.process_batch(chunk, query, background)
+        all_results.extend(batch_result)
 
-        # 4. 排序: 分数降序 -> 原始索引升序
-        if need_sorting:
-            all_results.sort(
-                key=lambda x: (x["score"], -x["original_index"]), reverse=True
-            )
+    # 4. 排序: 分数降序 -> 原始索引升序
+    if need_sorting:
+        all_results.sort(
+            key=lambda x: (x["score"], -x["original_index"]), reverse=True
+        )
 
-        return all_results
+    return all_results

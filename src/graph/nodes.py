@@ -300,6 +300,7 @@ async def _run_bi_bgi_and_mapper(
         #     llm_type = "lite_reasoning"
         # else:
         #     llm_type = "reasoning"
+        llm_type = "reasoning"
         try:
             mapper_llm = get_llm_by_type(llm_type)
             mapper_content = str(
